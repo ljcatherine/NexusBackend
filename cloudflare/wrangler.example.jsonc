@@ -1,0 +1,18 @@
+{
+  // Copy to the ignored cloudflare/wrangler.jsonc after creating the scoped VPC service and Access app.
+  // The example disables public routes and contains no real account configuration.
+  "name": "nexus-gateway",
+  "main": "worker.mjs",
+  "compatibility_date": "2026-10-30",
+  "workers_dev": false,
+  "preview_urls": false,
+  "vars": {
+    "ACCESS_AUDIENCE": "REPLACE_WITH_ACCESS_AUDIENCE",
+    "OWNER_EMAIL": "REPLACE_WITH_OWNER_EMAIL",
+    // Optional: a custom-domain hostname that serves only the Minecraft panel.
+    "PANEL_HOSTNAME": ""
+  },
+  "vpc_services": [
+    { "binding": "NEXUS_GATEWAY", "service_id": "REPLACE_WITH_VPC_SERVICE_ID", "remote": true }
+  ]
+}
