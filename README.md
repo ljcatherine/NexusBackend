@@ -150,6 +150,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 | [**NexusNix**](https://github.com/ljcatherine/NexusNix) · [**NexusWindows**](https://github.com/ljcatherine/NexusWindows) | Nexus Desktop for Linux and Windows |
 | [**NexusOnline**](https://github.com/ljcatherine/NexusOnline) | Web client at [nexus.liamjc.dev](https://nexus.liamjc.dev) |
 | [**NexusAI**](https://github.com/ljcatherine/NexusAI) | Local models on a PS5 |
+| [**NexusMinecraft**](https://github.com/ljcatherine/NexusMinecraft) | Minecraft server control panel, published through this gateway |
 | **NexusBackend** (this repo) | Gateway, Worker, orchestrator and workspace agent |
 
 <div align="center">
