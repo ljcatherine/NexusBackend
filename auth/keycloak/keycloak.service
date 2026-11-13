@@ -1,0 +1,32 @@
+# Keycloak for Nexus sign-in. Install as /etc/systemd/system/keycloak.service.
+[Unit]
+Description=Keycloak (Nexus sign-in)
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=exec
+User=keycloak
+Group=keycloak
+EnvironmentFile=/etc/keycloak/keycloak.env
+ExecStart=/opt/keycloak/bin/kc.sh start --optimized
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=180s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/opt/keycloak/data
+
+[Install]
+WantedBy=multi-user.target

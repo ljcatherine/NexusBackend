@@ -74,6 +74,7 @@ so the server opens no inbound ports.
 | 🧠 | [**`agent-orchestrator/`**](agent-orchestrator) | Python service that turns chats into durable agent runs, with human review for every patch and command. |
 | 📂 | [**`workspace-agent/`**](workspace-agent) | Go read-only workspace bridge, one per host (Debian and NixOS). |
 | 🤖 | [**`integrations/hermes/`**](integrations/hermes) | Optional Hermes engine worker used by the orchestrator. |
+| 🔑 | [**`auth/keycloak/`**](auth/keycloak) | Self-hosted Nexus sign-in page: a Keycloak theme and realm that Cloudflare Access uses with instant auth, so you never see Cloudflare's login screen. |
 | 🧰 | [**`scripts/`**](scripts) | Local gateway runner, Debian hardening, nftables rules and their tests, Access client registration. |
 
 ## Quick start

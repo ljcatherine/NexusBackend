@@ -1,0 +1,188 @@
+/* Nexus sign-in theme: Midnight Liquid Glass, matching nexus.liamjc.dev.
+   Loaded after Keycloak's login.css and PatternFly, so it only restyles; markup and
+   behaviour stay Keycloak's own. */
+@import url("https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=Geist:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap");
+
+:root {
+  color-scheme: dark;
+  --nx-bg: #070C18; --nx-surface: #172137; --nx-elevated: #202B42; --nx-editor: #0A1020; --nx-border: #28354A;
+  --nx-text: #E9EDF7; --nx-muted: #A6AFC2; --nx-dim: #6F7A92;
+  --nx-accent: #9CBCFF; --nx-purple: #C9ADFF; --nx-ok: #7CE8CA; --nx-warn: #F1C07E; --nx-err: #FF93A2;
+  --nx-display: "Bricolage Grotesque", "Space Grotesk", system-ui, sans-serif;
+  --nx-body: "Geist", "Inter", system-ui, sans-serif;
+  --nx-mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
+  --nx-glass: linear-gradient(180deg, rgba(255,255,255,.075), rgba(255,255,255,.02));
+  --nx-edge: inset 0 1px 0 rgba(255,255,255,.14);
+}
+
+/* Page */
+html.login-pf, .login-pf body {
+  background: var(--nx-bg) !important;
+  background-image: none !important;
+  color: var(--nx-text);
+  font: 15px/1.6 var(--nx-body);
+  min-height: 100%;
+}
+.nexus { -webkit-font-smoothing: antialiased; }
+.nx-aura {
+  position: fixed; inset: -20vmax; z-index: 0; pointer-events: none;
+  background:
+    radial-gradient(40vmax 30vmax at 20% 10%, rgba(39,69,127,.7), transparent 70%),
+    radial-gradient(35vmax 30vmax at 85% 30%, rgba(52,39,110,.6), transparent 70%),
+    radial-gradient(40vmax 30vmax at 50% 95%, rgba(27,58,99,.6), transparent 70%);
+  animation: nx-drift 30s ease-in-out infinite alternate;
+}
+@keyframes nx-drift { to { transform: translate3d(3vmax,-2vmax,0) rotate(4deg); } }
+.login-pf-page {
+  position: relative; z-index: 1;
+  min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: max(32px, env(safe-area-inset-top)) 16px max(32px, env(safe-area-inset-bottom));
+}
+
+/* Brand header */
+.login-pf-page .login-pf-page-header { margin: 0 0 18px; padding: 0; }
+#kc-header-wrapper.nx-brand {
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  padding: 0; font-size: 0; letter-spacing: 0; text-transform: none; color: var(--nx-text); white-space: normal;
+}
+.nx-mark { position: relative; width: 72px; height: 72px; display: grid; place-items: center; }
+.nx-mark img { position: relative; z-index: 1; width: 56px; height: 56px; border-radius: 15px; box-shadow: 0 12px 40px -8px rgba(156,188,255,.45); }
+.nx-halo { position: absolute; inset: -6px; border-radius: 50%; border: 1px solid rgba(156,188,255,.35); animation: nx-orbit 9s linear infinite; }
+.nx-halo::after { content: ""; position: absolute; top: -4px; left: 50%; width: 8px; height: 8px; border-radius: 50%; background: var(--nx-purple); box-shadow: 0 0 12px var(--nx-purple); }
+@keyframes nx-orbit { to { transform: rotate(360deg); } }
+.nx-eyebrow { font: 500 12px var(--nx-mono); letter-spacing: .14em; text-transform: uppercase; color: var(--nx-accent); }
+
+/* Card */
+.login-pf-page .card-pf.nx-card {
+  position: relative; width: min(440px, 100%); max-width: none; margin: 0; padding: 30px 30px 24px;
+  border-radius: 26px; border: 1px solid var(--nx-border); border-top: 1px solid var(--nx-border);
+  background: var(--nx-glass), rgba(23,33,55,.72);
+  box-shadow: var(--nx-edge), 0 40px 120px -40px rgba(39,69,127,.8);
+  -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
+  color: var(--nx-text);
+}
+.nx-card::before {
+  content: ""; position: absolute; inset: -1px; border-radius: inherit; padding: 1px; pointer-events: none;
+  background: linear-gradient(140deg, rgba(156,188,255,.55), transparent 35%, transparent 65%, rgba(201,173,255,.5));
+  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0); -webkit-mask-composite: xor; mask-composite: exclude;
+}
+.login-pf-page .login-pf-header { margin: 0 0 22px; text-align: center; }
+#kc-page-title {
+  margin: 0; color: var(--nx-text); text-align: center;
+  font: 800 clamp(26px, 6vw, 34px)/1.1 var(--nx-display); letter-spacing: -.02em;
+}
+#kc-content-wrapper { margin-top: 0; }
+
+/* Fields */
+.login-pf-page .pf-c-form__label, .login-pf-page label, .login-pf-page .pf-c-form__label-text {
+  color: var(--nx-muted); font: 500 13px var(--nx-body); margin-bottom: 6px;
+}
+.login-pf-page .form-group, .login-pf-page .pf-c-form__group { margin-bottom: 16px; }
+.login-pf-page .pf-c-form-control, .login-pf-page input[type=text], .login-pf-page input[type=email],
+.login-pf-page input[type=password], .login-pf-page input[type=number], .login-pf-page textarea, .login-pf-page select {
+  width: 100%; min-height: 46px; padding: 11px 14px;
+  background: rgba(10,16,32,.8) !important; color: var(--nx-text) !important;
+  border: 1px solid var(--nx-border) !important; border-radius: 12px !important;
+  font: 15px var(--nx-body); box-shadow: none !important; outline: none;
+  transition: border-color .2s, box-shadow .2s;
+}
+.login-pf-page .pf-c-form-control::after { display: none; }
+.login-pf-page .pf-c-form-control:hover { border-color: #3a4a66 !important; }
+.login-pf-page .pf-c-form-control:focus, .login-pf-page input:focus {
+  border-color: var(--nx-accent) !important; box-shadow: 0 0 0 3px rgba(156,188,255,.18) !important;
+}
+.login-pf-page .pf-c-form-control[aria-invalid=true] { border-color: var(--nx-err) !important; }
+.login-pf-page .pf-c-input-group { display: flex; gap: 8px; background: transparent !important; }
+.login-pf-page .pf-c-input-group .pf-c-form-control { border-radius: 12px !important; }
+.login-pf-page .pf-c-input-group .pf-c-button.pf-m-control {
+  min-width: 46px; border-radius: 12px; border: 1px solid var(--nx-border); background: rgba(10,16,32,.8); color: var(--nx-muted);
+}
+.login-pf-page .pf-c-input-group .pf-c-button.pf-m-control::after { display: none; }
+.login-pf-page .pf-c-input-group .pf-c-button.pf-m-control:hover { color: var(--nx-text); border-color: var(--nx-accent); }
+.login-pf-page .pf-m-error, .login-pf-page .kc-feedback-text.required { color: var(--nx-err); font-size: 13px; }
+
+/* Buttons */
+.login-pf-page .pf-c-button, .login-pf-page input[type=submit], .login-pf-page button {
+  font: 600 15px var(--nx-body); border-radius: 12px; cursor: pointer; transition: transform .2s, filter .2s, border-color .2s;
+}
+.login-pf-page .pf-c-button::after { display: none; }
+.login-pf-page .pf-c-button.pf-m-primary, .login-pf-page #kc-login, .login-pf-page input[type=submit].pf-c-button {
+  width: 100%; min-height: 48px; margin-top: 6px; border: 0;
+  color: var(--nx-bg) !important; background: linear-gradient(135deg, var(--nx-accent), var(--nx-purple)) !important;
+  box-shadow: 0 10px 30px -12px rgba(156,188,255,.6);
+}
+.login-pf-page .pf-c-button.pf-m-primary:hover, .login-pf-page #kc-login:hover { transform: translateY(-1px); filter: brightness(1.06); }
+.login-pf-page .pf-c-button.pf-m-secondary, .login-pf-page .btn-default {
+  width: 100%; min-height: 46px; color: var(--nx-text) !important;
+  background: var(--nx-glass) !important; border: 1px solid var(--nx-border) !important; box-shadow: var(--nx-edge);
+}
+.login-pf-page .pf-c-button.pf-m-secondary:hover, .login-pf-page .btn-default:hover { border-color: var(--nx-accent) !important; }
+.login-pf-page .pf-c-button:disabled, .login-pf-page .pf-c-button[aria-disabled=true] { opacity: .5; transform: none; }
+
+/* Options row, links, info */
+.login-pf-page a, .login-pf-page a:visited { color: var(--nx-accent); text-decoration: none; }
+.login-pf-page a:hover { color: var(--nx-purple); text-decoration: underline; }
+.login-pf-page #kc-form-options, .login-pf-page .login-pf-settings { margin: 2px 0 10px; color: var(--nx-muted); font-size: 13px; }
+.login-pf-page .pf-c-check__input, .login-pf-page input[type=checkbox] { accent-color: var(--nx-accent); }
+.login-pf-page #kc-info, .login-pf-page .login-pf-signup {
+  margin: 18px 0 0; padding: 14px 0 0; border-top: 1px solid var(--nx-border); background: none; color: var(--nx-muted); font-size: 13px; text-align: center;
+}
+.login-pf-page #kc-info-wrapper { padding: 0; background: none; }
+#try-another-way, #reset-login, #kc-attempted-username { color: var(--nx-accent); }
+.login-pf-page #kc-username { display: flex; align-items: center; justify-content: center; gap: 8px; margin-top: 10px; color: var(--nx-muted); }
+.login-pf-page #kc-username label { margin: 0; font: 500 14px var(--nx-mono); color: var(--nx-text); }
+.login-pf-page .kc-login-tooltip .kc-tooltip-text { background: var(--nx-elevated); color: var(--nx-text); border-radius: 8px; }
+
+/* Alerts */
+.login-pf-page .pf-c-alert {
+  display: flex; align-items: flex-start; gap: 10px; margin: 0 0 18px; padding: 12px 14px;
+  border-radius: 12px; border: 1px solid var(--nx-border); border-top-width: 1px; background: rgba(10,16,32,.7); color: var(--nx-text); box-shadow: none;
+}
+.login-pf-page .pf-c-alert::before { display: none; }
+.login-pf-page .pf-c-alert.pf-m-danger { border-color: rgba(255,147,162,.45); background: rgba(255,147,162,.08); }
+.login-pf-page .pf-c-alert.pf-m-danger .pf-c-alert__icon { color: var(--nx-err); }
+.login-pf-page .pf-c-alert.pf-m-warning { border-color: rgba(241,192,126,.45); background: rgba(241,192,126,.08); }
+.login-pf-page .pf-c-alert.pf-m-warning .pf-c-alert__icon { color: var(--nx-warn); }
+.login-pf-page .pf-c-alert.pf-m-success { border-color: rgba(124,232,202,.45); background: rgba(124,232,202,.08); }
+.login-pf-page .pf-c-alert.pf-m-success .pf-c-alert__icon { color: var(--nx-ok); }
+.login-pf-page .pf-c-alert.pf-m-info .pf-c-alert__icon { color: var(--nx-accent); }
+.login-pf-page .pf-c-alert__title, .login-pf-page .kc-feedback-text { color: var(--nx-text); font: 500 14px var(--nx-body); }
+
+/* Choosing a sign-in method (passkey, password, OTP) */
+.login-pf-page .select-auth-box-parent {
+  border: 1px solid var(--nx-border); border-radius: 16px; padding: 14px 16px; margin-bottom: 10px;
+  background: rgba(10,16,32,.7); transition: border-color .2s, transform .2s;
+}
+.login-pf-page .select-auth-box-parent:hover { border-color: var(--nx-accent); transform: translateY(-1px); }
+.login-pf-page .select-auth-box-headline { color: var(--nx-text); font: 600 15px var(--nx-body); }
+.login-pf-page .select-auth-box-desc { color: var(--nx-muted); font-size: 13px; }
+.login-pf-page .select-auth-box-icon, .login-pf-page .select-auth-box-arrow { color: var(--nx-accent); }
+.login-pf-page .pf-c-tile { border-radius: 14px; background: rgba(10,16,32,.7); border: 1px solid var(--nx-border); color: var(--nx-text); }
+.login-pf-page .pf-c-tile.pf-m-selected, .login-pf-page .pf-c-tile:hover { border-color: var(--nx-accent); }
+.login-pf-page .pf-c-tile::before { display: none; }
+
+/* OTP and recovery codes */
+.login-pf-page #kc-totp-secret-qr-code { border-radius: 12px; background: #fff; padding: 8px; }
+.login-pf-page .kc-recovery-codes-list { background: var(--nx-editor); border: 1px solid var(--nx-border); border-radius: 12px; font-family: var(--nx-mono); color: var(--nx-text); }
+
+/* Social providers (kept for completeness; Nexus uses none) */
+.login-pf-page .kc-social-section { border-top: 1px solid var(--nx-border); }
+.login-pf-page .kc-social-item { border-radius: 12px; border: 1px solid var(--nx-border); background: var(--nx-glass); color: var(--nx-text); }
+
+/* Locale menu */
+.login-pf-page #kc-locale-dropdown button { color: var(--nx-muted); background: none; border: 0; }
+.login-pf-page .pf-c-dropdown__menu { background: var(--nx-elevated); border: 1px solid var(--nx-border); border-radius: 12px; }
+.login-pf-page .pf-c-dropdown__menu-item { color: var(--nx-text); }
+
+/* Footer */
+.nx-foot { margin: 22px 0 0; color: var(--nx-dim); font: 500 12px var(--nx-mono); letter-spacing: .06em; text-align: center; }
+.nx-foot a, .nx-foot a:visited { color: var(--nx-muted); }
+
+:focus-visible { outline: 2px solid var(--nx-accent); outline-offset: 3px; border-radius: 8px; }
+
+@media (max-width: 480px) {
+  .login-pf-page .card-pf.nx-card { padding: 24px 18px 18px; border-radius: 22px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .nx-aura, .nx-halo { animation: none; }
+}
