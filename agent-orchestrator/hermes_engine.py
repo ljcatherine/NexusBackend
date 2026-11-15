@@ -72,34 +72,46 @@ def flatten_messages(messages, names):
 
 
 class DockerWorker:
-    def __init__(self, executable, image):
+    """One networkless, read-only, unprivileged container per run.
+
+    The defaults describe the Hermes worker; other engines (DeepSeek Harness)
+    pass their own image labels, container name prefix, entrypoint and limits.
+    """
+    def __init__(self, executable, image, *, engine='Hermes', labels=None, name_prefix='nexus-hermes-',
+                 entrypoint=('/opt/venv/bin/python', '/opt/nexus/worker.py'), pids=64, tmpfs_mb=64):
         if (not executable or not os.path.isabs(executable) or not os.access(executable, os.X_OK) or
                 not re.fullmatch(r'sha256:[0-9a-f]{64}', image or '')):
-            raise HermesUnavailable('configure a trusted Docker executable and immutable Hermes image ID')
+            raise HermesUnavailable(f'configure a trusted Docker executable and immutable {engine} image ID')
+        if not re.fullmatch(r'nexus-[a-z]+-', name_prefix):
+            raise ValueError('invalid worker container prefix')
         self.executable, self.image = executable, image
+        self.engine, self.name_prefix, self.entrypoint = engine, name_prefix, tuple(entrypoint)
+        self.labels = dict(labels or {'org.nexus.hermes.revision': REVISION, 'org.nexus.hermes.protocol': '1'})
+        self.pids, self.tmpfs_mb = int(pids), int(tmpfs_mb)
         self.quarantined = False
 
     def converse(self, request, handle, cancelled):
+        engine = self.engine
         if self.quarantined:
-            raise HermesUnavailable('Hermes container cleanup requires an operator check')
+            raise HermesUnavailable(f'{engine} container cleanup requires an operator check')
         if cancelled():
-            raise InterruptedError('Hermes run cancelled before worker admission')
+            raise InterruptedError(f'{engine} run cancelled before worker admission')
         metadata = subprocess.run([self.executable, 'image', 'inspect', '--format', '{{json .Config.Labels}}', self.image],
             env={}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, check=True)
-        labels = json.loads(metadata.stdout)
-        if labels.get('org.nexus.hermes.revision') != REVISION or labels.get('org.nexus.hermes.protocol') != '1':
-            raise HermesUnavailable('Hermes image does not match the pinned protocol and revision')
-        previous = subprocess.run([self.executable, 'ps', '-a', '--filter', 'name=nexus-hermes-',
+        labels = json.loads(metadata.stdout) or {}
+        if any(labels.get(key) != value for key, value in self.labels.items()):
+            raise HermesUnavailable(f'{engine} image does not match the pinned protocol and revision')
+        previous = subprocess.run([self.executable, 'ps', '-a', '--filter', 'name=' + self.name_prefix,
             '--format', '{{.Names}}'], env={}, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, check=True)
         if previous.stdout.strip():
-            raise HermesUnavailable('an earlier Hermes container requires an operator check')
-        name = 'nexus-hermes-' + uuid.uuid4().hex
+            raise HermesUnavailable(f'an earlier {engine} container requires an operator check')
+        name = self.name_prefix + uuid.uuid4().hex
         command = [self.executable, 'create', '-i', '--name', name, '--network', 'none',
             '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
-            '--pids-limit', '64', '--memory', '1g', '--memory-swap', '1g', '--cpus', '1',
-            '--user', '65534:65534', '--tmpfs', '/tmp:rw,nosuid,nodev,size=64m,mode=1777',
-            '--entrypoint', '/opt/venv/bin/python', self.image, '/opt/nexus/worker.py']
+            '--pids-limit', str(self.pids), '--memory', '1g', '--memory-swap', '1g', '--cpus', '1',
+            '--user', '65534:65534', '--tmpfs', f'/tmp:rw,nosuid,nodev,size={self.tmpfs_mb}m,mode=1777',
+            '--entrypoint', self.entrypoint[0], self.image, *self.entrypoint[1:]]
         # Admit a named, stopped container first. Killing an attached `docker run`
         # client during creation could otherwise race a later daemon-side create.
         try:
