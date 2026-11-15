@@ -153,6 +153,11 @@ class Controller:
             from hermes_engine import DockerWorker, HermesEngine
             self.hermes_engine = HermesEngine(DockerWorker(
                 env.get('NEXUS_HERMES_DOCKER', '/usr/bin/docker'), env['NEXUS_HERMES_IMAGE']))
+        self.dsh_engine = None
+        if env.get('NEXUS_DSH_IMAGE'):
+            from dsh_engine import DshEngine, dsh_worker
+            self.dsh_engine = DshEngine(dsh_worker(
+                env.get('NEXUS_DSH_DOCKER', '/usr/bin/docker'), env['NEXUS_DSH_IMAGE']))
         # A Qwen thinking-model can spend the entire bounded output budget on
         # reasoning_content and return an empty user-visible answer. Keep
         # ordinary agent and compaction calls non-thinking unless the operator
@@ -644,6 +649,11 @@ class Controller:
                 raise AgentError(503, 'Hermes engine is not configured')
             return self.hermes_engine.run(self, messages, model, context_window, output_budget,
                 workspace, report, check_cancel, run_state, proposal_checkpoint, resume, compacted=compacted)
+        if run_state and run_state.get('engine') == 'dsh':
+            if self.dsh_engine is None:
+                raise AgentError(503, 'DeepSeek Harness engine is not configured')
+            return self.dsh_engine.run(self, messages, model, context_window, output_budget,
+                workspace, report, check_cancel, run_state, None, resume, compacted=compacted)
         if workspace is None:
             return self.llm(messages, max_tokens=output_budget, model=model, cancelled=check_cancel), input_count, compacted, []
 
@@ -1025,10 +1035,15 @@ class Controller:
         allowed = {"prompt", "history", "workspace", "subagents", "auto_compact", "compact_only", "allow_proposals", "engine"}
         if not set(payload) <= allowed:
             raise AgentError(400, "unknown request field")
-        if payload.get('engine', 'nexus') not in ('nexus', 'hermes'):
+        if payload.get('engine', 'nexus') not in ('nexus', 'hermes', 'dsh'):
             raise AgentError(400, 'unknown agent engine')
         if payload.get('engine') == 'hermes' and self.hermes_engine is None:
             raise AgentError(503, 'Hermes engine is not configured')
+        if payload.get('engine') == 'dsh':
+            if self.dsh_engine is None:
+                raise AgentError(503, 'DeepSeek Harness engine is not configured')
+            if payload.get('allow_proposals', False):
+                raise AgentError(400, 'DeepSeek Harness runs are read-only; use the Nexus or Hermes engine for proposals')
         prompt, history = payload.get("prompt"), payload.get("history", [])
         n = payload.get("subagents", 0)
         if (not isinstance(prompt, str) or not 1 <= len(prompt.encode("utf-8")) <= MAX_PROMPT or
@@ -1106,6 +1121,8 @@ class Controller:
         context_window = self.model_context_window()
         if payload.get('engine') == 'hermes' and context_window < 64_000:
             raise AgentError(413, 'Hermes requires at least 64000 verified context tokens')
+        if payload.get('engine') == 'dsh' and context_window < 64_000:
+            raise AgentError(413, 'DeepSeek Harness requires at least 64000 verified context tokens')
         output_budget = output_budget_for(context_window)
         if len(history) + 2 > MAX_HISTORY and not auto_compact:
             raise AgentError(413, "history would exceed next-turn message limit")
