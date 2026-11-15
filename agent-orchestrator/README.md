@@ -29,6 +29,15 @@ execution grant: fixed-profile commands require independent human approval
 and no uncertain execution replay.
 
 
+## Optional DeepSeek Harness engine
+
+`engine:"dsh"` runs the pinned DeepSeek Harness agent loop in the Hermes engine's networkless
+container and protocol when `NEXUS_DSH_IMAGE` names the image built by
+`scripts/build-dsh-worker.sh` (`NEXUS_DSH_DOCKER` defaults to `/usr/bin/docker`). Its model is a
+loopback shim answered by Nexus's PS5 transport, and its only tools are Nexus's scoped read tools over
+MCP. Runs are read-only (`allow_proposals` is refused) and need at least 64,000 verified context
+tokens. Unconfigured, it answers 503. See [`integrations/dsh`](../integrations/dsh/README.md).
+
 ## Optional Hermes engine
 
 The existing owned agent-run API accepts `engine:"hermes"` when the administrator
