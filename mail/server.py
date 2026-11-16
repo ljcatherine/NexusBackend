@@ -19,6 +19,7 @@ import sqlite3
 import ssl
 import sys
 import time
+import urllib.request
 import uuid
 from contextlib import contextmanager
 from email import policy
@@ -109,6 +110,31 @@ def addresses(raw) -> list[dict]:
     return out
 
 
+def sender_auth(msg) -> str:
+    """'pass' when the receiving server (Cloudflare Email Routing) reports DMARC pass, 'fail' when it
+    reports anything else, '' when there is no trustworthy result.
+
+    Only the topmost Authentication-Results / ARC-Authentication-Results header counts, and only if
+    Cloudflare wrote it: senders can add fake results lower down, but cannot get above the header the
+    receiving server prepends. Confirm against a real message (security review NEX-006).
+    """
+    for name, value in msg.items():
+        if name.lower() not in ('authentication-results', 'arc-authentication-results'):
+            continue
+        text = re.sub(r'\s+', ' ', str(value)).strip()
+        text = re.sub(r'^i=\d+;\s*', '', text, flags=re.I)
+        authserv = text.split(';', 1)[0].strip().lower()
+        if not (authserv == 'cloudflare.net' or authserv.endswith('.cloudflare.net') or authserv.endswith('.cloudflare.com')):
+            return ''
+        result = re.search(r'\bdmarc=([a-z]+)', text, re.I)
+        return 'pass' if result and result.group(1).lower() == 'pass' else 'fail'
+    return ''
+
+
+def clean_filename(name: str) -> str:
+    return re.sub(r'[\x00-\x1f\x7f]+', ' ', name).strip()[:200] or 'attachment'
+
+
 def clean_recipients(values) -> list[dict]:
     if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
         raise Fail(400, 'Recipients must be a list of addresses.')
@@ -125,6 +151,9 @@ class Store:
         os.makedirs(os.path.join(directory, 'attachments'), mode=0o700, exist_ok=True)
         with self.db() as db:
             db.executescript(SCHEMA)
+            columns = {r['name'] for r in db.execute('PRAGMA table_info(messages)')}
+            if 'sender_auth' not in columns:  # added after the first release
+                db.execute("ALTER TABLE messages ADD COLUMN sender_auth TEXT NOT NULL DEFAULT ''")
 
     @contextmanager
     def db(self):
@@ -183,8 +212,9 @@ class Store:
                 return row['thread_id']
         return None
 
-    def receive(self, raw: bytes, envelope_from: str, envelope_to: str) -> dict:
+    def receive(self, raw: bytes, envelope_from: str, envelope_to: str, limits: dict | None = None) -> dict:
         msg = BytesParser(policy=policy.default).parsebytes(raw)
+        limits = limits or {}
         message_id = str(msg.get('message-id', '') or '').strip()[:998]
         with self.db() as db:
             if message_id:
@@ -194,6 +224,8 @@ class Store:
                     return dict(dup)
         sender = addresses(str(msg.get('from', '') or ''))
         sender = sender[0] if sender else {'name': '', 'address': envelope_from}
+        self.check_limits(len(raw), sender['address'], limits)
+        auth = sender_auth(msg)
         text_part = msg.get_body(preferencelist=('plain',))
         html_part = msg.get_body(preferencelist=('html',))
         text = text_part.get_content() if text_part else ''
@@ -208,15 +240,33 @@ class Store:
         mid = str(uuid.uuid4())
         meta = self.save_attachments(mid, files)
         with self.db() as db:
-            thread = self.find_thread(db, refs + [in_reply_to], subject, sender['address']) or mid
+            # Unverified mail may only join a conversation it explicitly references, never by subject.
+            thread = self.find_thread(db, refs + [in_reply_to], subject if auth == 'pass' else '', sender['address']) or mid
             db.execute("""INSERT INTO messages (id, thread_id, folder, received_at, message_id, in_reply_to, refs, subject, subject_key,
-                from_addr, from_name, to_json, cc_json, reply_to, envelope_to, text, html, attachments)
-                VALUES (?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                from_addr, from_name, to_json, cc_json, reply_to, envelope_to, text, html, attachments, sender_auth)
+                VALUES (?, ?, 'inbox', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (mid, thread, now_ms(), message_id, in_reply_to, ' '.join(refs), subject, subject_key(subject),
                  sender['address'][:320], sender['name'][:200], json.dumps(addresses(msg.get_all('to', []))),
                  json.dumps(addresses(msg.get_all('cc', []))), str(msg.get('reply-to', '') or '')[:998],
-                 envelope_to[:320], text[:MAX_TEXT], html[:MAX_TEXT], json.dumps(meta)))
+                 envelope_to[:320], text[:MAX_TEXT], html[:MAX_TEXT], json.dumps(meta), auth))
         return {'id': mid, 'thread_id': thread}
+
+    def check_limits(self, size: int, sender: str, limits: dict) -> None:
+        """Refuse mail that would fill the disk (Keycloak shares it) or floods in from one sender. main() sets the limits."""
+        disk = shutil.disk_usage(self.dir)
+        if disk.free - size < disk.total * limits.get('min_free_percent', 0) / 100:
+            raise Fail(507, 'The mail server is low on disk space.')
+        with self.db() as db:
+            # shortcut: sums the whole mailbox per message; fine for one person, cache it if mail grows large.
+            used = db.execute("""SELECT COALESCE(SUM(length(text) + length(html)), 0) +
+                (SELECT COALESCE(SUM(json_extract(j.value, '$.size')), 0) FROM messages, json_each(messages.attachments) j)
+                FROM messages""").fetchone()[0]
+            if used + size > limits.get('max_store_bytes', float('inf')):
+                raise Fail(507, 'The mailbox is full.')
+            recent = db.execute("SELECT COUNT(*) FROM messages WHERE lower(from_addr) = ? AND folder != 'sent' AND received_at > ?",
+                                (sender.lower(), now_ms() - 3600_000)).fetchone()[0]
+            if recent >= limits.get('sender_hourly', float('inf')):
+                raise Fail(429, 'Too much mail from this sender. Try again later.')
 
     def threads(self, folder: str, q: str, offset: int) -> dict:
         if folder not in FOLDERS:
@@ -228,7 +278,7 @@ class Store:
             args += [like] * 5
         with self.db() as db:
             # shortcut: groups in Python over the newest 5000 matches; fine for one person's mailbox.
-            rows = db.execute(f"""SELECT id, thread_id, folder, received_at, subject, from_addr, from_name, to_json,
+            rows = db.execute(f"""SELECT id, thread_id, folder, received_at, subject, from_addr, from_name, to_json, sender_auth,
                 substr(CASE WHEN text != '' THEN text ELSE html END, 1, 600) AS body
                 FROM messages WHERE {where} ORDER BY received_at DESC LIMIT 5000""", args).fetchall()
             latest, order = {}, []
@@ -266,6 +316,7 @@ class Store:
                 'snippet': (plain(body) if '<' in body else re.sub(r'\s+', ' ', body)).strip()[:200],
                 'count': s['n'] if s else 1, 'unread': bool(s and s['unread']), 'starred': bool(s and s['starred']),
                 'has_attachments': bool(s and s['files']),
+                'sender_auth': r['sender_auth'],
             })
         return {'threads': out, 'more': len(order) > offset + PAGE, 'total': len(order),
                 'counts': {'inbox': counts['inbox'], 'drafts': counts['drafts']}}
@@ -438,13 +489,13 @@ class Mailer:
             keep = body.get('keepAttachments')
             for i, meta in enumerate(json.loads(original['attachments'])):
                 if not isinstance(keep, list) or i in keep:
-                    files.append((meta['filename'], meta['type'], self.store.attachment(original['id'], i)[1]))
+                    files.append((clean_filename(meta['filename']), meta['type'], self.store.attachment(original['id'], i)[1]))
         for a in body.get('attachments') or []:
             try:
                 data = base64.b64decode(str(a.get('data', '')), validate=True)
             except (ValueError, AttributeError):
                 raise Fail(400, 'An attachment could not be read.')
-            files.append((str(a.get('filename') or 'attachment')[:200], str(a.get('type') or 'application/octet-stream')[:100], data))
+            files.append((clean_filename(str(a.get('filename') or '')), str(a.get('type') or 'application/octet-stream')[:100], data))
         if len(files) > 32:
             raise Fail(400, 'At most 32 attachments per message.')
         for name, mime, data in files:
@@ -485,12 +536,65 @@ class Mailer:
         return {'ok': True, 'id': mid, 'thread_id': thread or mid}
 
 
+class AccessVerifier:
+    """Checks the owner's Cloudflare Access token (RS256) on every mailbox request, so the shared
+    service token alone is not enough to read mail (security review NEX-013). Needs python3-cryptography."""
+
+    def __init__(self, team: str, audience: str, owner: str, fetch=None):
+        from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: F401  (fail at startup, not per request)
+        self.team, self.audience, self.owner = team.lower(), audience, owner.lower()
+        self.fetch = fetch or (lambda url: urllib.request.urlopen(url, timeout=10).read())
+        self.keys: dict = {}
+        self.fetched = 0.0
+
+    def key(self, kid: str):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        age = time.time() - self.fetched
+        if age > 600 or (kid not in self.keys and age > 60):
+            keys = {}
+            for k in json.loads(self.fetch(f'https://{self.team}/cdn-cgi/access/certs')).get('keys', []):
+                if k.get('kty') == 'RSA' and isinstance(k.get('kid'), str) and k.get('alg', 'RS256') == 'RS256':
+                    keys[k['kid']] = rsa.RSAPublicNumbers(int.from_bytes(b64url(k['e']), 'big'),
+                                                          int.from_bytes(b64url(k['n']), 'big')).public_key()
+            self.keys, self.fetched = keys, time.time()
+        return self.keys.get(kid)
+
+    def verify(self, token: str, now: float | None = None) -> bool:
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        try:
+            if not token or len(token) > 16384:
+                return False
+            head, body, sig = token.split('.')
+            header, claims = json.loads(b64url(head)), json.loads(b64url(body))
+            if header.get('alg') != 'RS256' or not isinstance(header.get('kid'), str):
+                return False
+            key = self.key(header['kid'])
+            if key is None:
+                return False
+            key.verify(b64url(sig), f'{head}.{body}'.encode(), padding.PKCS1v15(), hashes.SHA256())
+            now = time.time() if now is None else now
+            audiences = claims.get('aud') if isinstance(claims.get('aud'), list) else [claims.get('aud')]
+            return (self.audience in audiences and claims.get('iss') == f'https://{self.team}'
+                    and isinstance(claims.get('exp'), (int, float)) and claims['exp'] > now
+                    and not (isinstance(claims.get('nbf'), (int, float)) and claims['nbf'] > now + 60)
+                    and str(claims.get('email', '')).strip().lower() == self.owner)
+        except (InvalidSignature, ValueError, KeyError, TypeError, OSError):
+            return False
+
+
+def b64url(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text + '=' * (-len(text) % 4))
+
+
 class Service(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, store: Store, mailer: Mailer, token: str):
+    def __init__(self, address, store: Store, mailer: Mailer, token: str, verifier: 'AccessVerifier | None' = None, limits: dict | None = None):
         super().__init__(address, Handler)
         self.store, self.mailer, self.token = store, mailer, token
+        self.verifier, self.limits = verifier, limits or {}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -541,6 +645,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise Fail(401, 'Not authorized.')
             url = urlsplit(self.path)
             parts = [p for p in url.path.split('/') if p]
+            if parts != ['inbound'] and self.server.verifier and not self.server.verifier.verify(self.headers.get('X-Access-Jwt', '')):
+                self.close_connection = True
+                raise Fail(401, 'Not authorized.')
             query = {k: v[0] for k, v in parse_qs(url.query).items()}
             self.route(method, parts, query)
         except Fail as e:
@@ -554,7 +661,7 @@ class Handler(BaseHTTPRequestHandler):
         match method, parts:
             case 'POST', ['inbound']:
                 raw = self.body(MAX_INBOUND)
-                self.reply(200, store.receive(raw, self.headers.get('X-Envelope-From', ''), self.headers.get('X-Envelope-To', '')))
+                self.reply(200, store.receive(raw, self.headers.get('X-Envelope-From', ''), self.headers.get('X-Envelope-To', ''), self.server.limits))
             case 'GET', ['threads']:
                 offset = query.get('offset', '0')
                 if not offset.isdigit():
@@ -607,8 +714,22 @@ def main() -> None:
     mailer = Mailer(store, dict(env))
     if not mailer.senders:
         sys.exit('NEXUS_MAIL_FROM must list your address, for example liam@liamjc.dev')
+    team, audience, owner = (env.get(k, '').strip() for k in ('NEXUS_MAIL_ACCESS_TEAM', 'NEXUS_MAIL_ACCESS_AUD', 'NEXUS_MAIL_OWNER'))
+    verifier = None
+    if team or audience or owner:
+        if not (re.fullmatch(r'[a-z0-9-]{1,63}\.cloudflareaccess\.com', team.lower()) and re.fullmatch(r'[a-f0-9]{64}', audience) and '@' in owner):
+            sys.exit('NEXUS_MAIL_ACCESS_TEAM, NEXUS_MAIL_ACCESS_AUD and NEXUS_MAIL_OWNER must all be set and valid')
+        try:
+            verifier = AccessVerifier(team, audience, owner)
+        except ImportError:
+            sys.exit('Install python3-cryptography to check Access tokens: sudo apt install python3-cryptography')
+    else:
+        print('nexus-mail: WARNING Access token check is off; set NEXUS_MAIL_ACCESS_TEAM, _AUD and NEXUS_MAIL_OWNER', file=sys.stderr)
+    limits = {'max_store_bytes': int(env.get('NEXUS_MAIL_MAX_STORE_MB', '5000')) * MB,
+              'min_free_percent': int(env.get('NEXUS_MAIL_MIN_FREE_PERCENT', '10')),
+              'sender_hourly': int(env.get('NEXUS_MAIL_SENDER_HOURLY', '60'))}
     print(f'nexus-mail listening on {host}:{port}', file=sys.stderr)
-    Service((host, int(port)), store, mailer, token).serve_forever()
+    Service((host, int(port)), store, mailer, token, verifier, limits).serve_forever()
 
 
 if __name__ == '__main__':

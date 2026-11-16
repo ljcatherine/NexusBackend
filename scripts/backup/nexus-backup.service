@@ -1,0 +1,13 @@
+[Unit]
+Description=Nexus encrypted backup (mailbox and Keycloak database)
+After=postgresql.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/nexus-backup/nexus-backup.env
+ExecStart=/usr/local/sbin/nexus-backup.sh
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectHome=true

@@ -13,6 +13,7 @@ import server
 
 ME = 'liam@liamjc.dev'
 TOKEN = 't' * 40
+CF_PASS = 'Authentication-Results: mx.cloudflare.net; dkim=pass header.d=example.com; spf=pass; dmarc=pass header.from=example.com\r\n'
 
 
 def raw_mail(subject='Hello', sender='Sam Rivera <sam@example.org>', msg_id='<a1@example.org>', extra='', body='Hi Liam', attach=False):
@@ -82,10 +83,44 @@ class MailTest(unittest.TestCase):
 
     def test_reply_without_references_matches_subject_and_person(self):
         self.mailer.send({'from': ME, 'to': ['ada@example.com'], 'subject': 'Engine notes', 'text': 'x'})
-        back = self.store.receive(raw_mail('RE: Engine notes', sender='Ada <ada@example.com>', msg_id='<z@x>'), 'ada@example.com', ME)
-        stranger = self.store.receive(raw_mail('Re: Engine notes', sender='eve@example.com', msg_id='<y@x>'), 'eve@example.com', ME)
+        back = self.store.receive(raw_mail('RE: Engine notes', sender='Ada <ada@example.com>', msg_id='<z@x>', extra=CF_PASS), 'ada@example.com', ME)
+        stranger = self.store.receive(raw_mail('Re: Engine notes', sender='eve@example.com', msg_id='<y@x>', extra=CF_PASS), 'eve@example.com', ME)
+        spoof = self.store.receive(raw_mail('Re: Engine notes', sender='Ada <ada@example.com>', msg_id='<w@x>'), 'x@evil.example', ME)
         self.assertEqual(len(self.store.thread(back['thread_id'])['messages']), 2)
         self.assertNotEqual(stranger['thread_id'], back['thread_id'])
+        self.assertNotEqual(spoof['thread_id'], back['thread_id'])  # unverified mail never joins by subject
+
+    def test_sender_check_trusts_only_cloudflares_topmost_result(self):
+        forged = 'Authentication-Results: mx.cloudflare.net; dmarc=pass header.from=bank.com\r\n'
+        cases = {
+            'cloudflare pass': (CF_PASS, 'pass'),
+            'arc pass': ('ARC-Authentication-Results: i=1; mx.cloudflare.net; dkim=pass; dmarc=pass header.from=example.org\r\n', 'pass'),
+            'cloudflare fail': ('Authentication-Results: mx.cloudflare.net; spf=fail; dmarc=fail header.from=example.org\r\n', 'fail'),
+            'forged below a real fail': ('Authentication-Results: mx.cloudflare.net; dmarc=none\r\n' + forged, 'fail'),
+            'foreign server on top': ('Authentication-Results: mail.evil.example; dmarc=pass\r\n' + forged, ''),
+            'none': ('', ''),
+        }
+        for i, (name, (extra, expected)) in enumerate(cases.items()):
+            r = self.store.receive(raw_mail(msg_id=f'<auth{i}@x>', extra=extra), 's@example.org', ME)
+            self.assertEqual(self.store.thread(r['thread_id'])['messages'][0]['sender_auth'], expected, name)
+
+    def test_limits_refuse_floods_and_full_mailboxes(self):
+        self.store.receive(raw_mail(msg_id='<l1@x>'), 's@example.org', ME, {'sender_hourly': 2})
+        self.store.receive(raw_mail(msg_id='<l2@x>'), 's@example.org', ME, {'sender_hourly': 2})
+        with self.assertRaises(server.Fail) as e:
+            self.store.receive(raw_mail(msg_id='<l3@x>'), 's@example.org', ME, {'sender_hourly': 2})
+        self.assertEqual(e.exception.status, 429)
+        with self.assertRaises(server.Fail) as e:
+            self.store.receive(raw_mail(msg_id='<l4@x>', attach=True), 'o@example.org', ME, {'max_store_bytes': 10})
+        self.assertEqual(e.exception.status, 507)
+        with self.assertRaises(server.Fail) as e:
+            self.store.receive(raw_mail(msg_id='<l5@x>'), 'o@example.org', ME, {'min_free_percent': 100})
+        self.assertEqual(e.exception.status, 507)
+
+    def test_attachment_names_are_cleaned(self):
+        self.mailer.send({'from': ME, 'to': ['a@b.co'], 'subject': 's', 'text': 't',
+                          'attachments': [{'filename': 'a.txt\r\nBcc: e@v.il', 'type': 'text/plain', 'data': base64.b64encode(b'x').decode()}]})
+        self.assertEqual([p.get_filename() for p in FakeSMTP.sent[0][0].iter_attachments()], ['a.txt Bcc: e@v.il'])
 
     def test_forward_keeps_chosen_attachments(self):
         orig = self.store.receive(raw_mail(attach=True), 's@example.org', ME)
@@ -185,6 +220,71 @@ class HTTPTest(unittest.TestCase):
         self.assertEqual(self.call('/threads?folder=nope')[0], 400)
         self.assertEqual(self.call('/../etc/passwd')[0], 404)
         self.assertEqual(json.loads(self.call('/config')[1])['sending'], False)
+
+
+class AccessTokenTest(unittest.TestCase):
+    TEAM, AUD = 'nexus-test.cloudflareaccess.com', 'a' * 64
+
+    @classmethod
+    def setUpClass(cls):
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        cls.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        cls.other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        nums = cls.key.public_key().public_numbers()
+        b = lambda n: base64.urlsafe_b64encode(n.to_bytes((n.bit_length() + 7) // 8, 'big')).rstrip(b'=').decode()
+        cls.jwks = json.dumps({'keys': [{'kty': 'RSA', 'kid': 'k1', 'alg': 'RS256', 'n': b(nums.n), 'e': b(nums.e)}]}).encode()
+
+    def sign(self, key=None, header=None, **claims):
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+        enc = lambda o: base64.urlsafe_b64encode(json.dumps(o).encode()).rstrip(b'=').decode()
+        body = {'aud': [self.AUD], 'iss': f'https://{self.TEAM}', 'email': ME, 'exp': 2_000_000_000, **claims}
+        head = f"{enc(header or {'alg': 'RS256', 'kid': 'k1'})}.{enc(body)}"
+        sig = (key or self.key).sign(head.encode(), padding.PKCS1v15(), hashes.SHA256())
+        return f"{head}.{base64.urlsafe_b64encode(sig).rstrip(b'=').decode()}"
+
+    def verifier(self):
+        return server.AccessVerifier(self.TEAM, self.AUD, ME, fetch=lambda url: self.jwks)
+
+    def test_accepts_only_the_owners_valid_token(self):
+        v, now = self.verifier(), 1_900_000_000
+        self.assertTrue(v.verify(self.sign(), now))
+        bad = {
+            'wrong audience': self.sign(aud=['b' * 64]), 'wrong issuer': self.sign(iss='https://evil.cloudflareaccess.com'),
+            'expired': self.sign(exp=now - 1), 'someone else': self.sign(email='eve@example.com'),
+            'other key': self.sign(key=self.other), 'unknown kid': self.sign(header={'alg': 'RS256', 'kid': 'nope'}),
+            'alg none': self.sign().rsplit('.', 1)[0].replace(self.sign().split('.')[0], base64.urlsafe_b64encode(b'{"alg":"none","kid":"k1"}').rstrip(b'=').decode()) + '.',
+            'garbage': 'a.b.c', 'empty': '',
+        }
+        for name, token in bad.items():
+            self.assertFalse(v.verify(token, now), name)
+
+    def test_http_requires_token_except_inbound(self):
+        tmp = tempfile.TemporaryDirectory()
+        store = server.Store(tmp.name)
+        srv = server.Service(('127.0.0.1', 0), store, server.Mailer(store, {'NEXUS_MAIL_FROM': ME}), TOKEN, self.verifier())
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f'http://127.0.0.1:{srv.server_address[1]}'
+
+        def call(path, jwt=None, data=None):
+            req = urllib.request.Request(base + path, data=data, method='POST' if data else 'GET', headers={'Authorization': f'Bearer {TOKEN}'})
+            if jwt:
+                req.add_header('X-Access-Jwt', jwt)
+            try:
+                with urllib.request.urlopen(req) as res:
+                    return res.status
+            except urllib.error.HTTPError as e:
+                with e:
+                    return e.code
+        try:
+            self.assertEqual(call('/threads'), 401)
+            self.assertEqual(call('/threads', jwt=self.sign(email='eve@example.com')), 401)
+            self.assertEqual(call('/threads', jwt=self.sign()), 200)
+            self.assertEqual(call('/inbound', data=raw_mail()), 200)  # Email Routing has no user token
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            tmp.cleanup()
 
 
 if __name__ == '__main__':
