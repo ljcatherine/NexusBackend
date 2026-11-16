@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=%h/.local/bin/nexus-gateway
 EnvironmentFile=%h/.config/nexus-gateway/nexus.env
+LoadCredential=nexus-ps5-token:%h/.config/nexus-gateway/ps5-token
 Environment=NEXUS_MODEL_STATE_PATH=%S/nexus-gateway/model-state/pending-switch.json
 StateDirectory=nexus-gateway
 StateDirectoryMode=0700

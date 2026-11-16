@@ -46,10 +46,12 @@ const (
 	maxMessages                     = 100
 	maxMessageBytes                 = 128 << 10
 	maxImagesPerMessage             = 3
-	maxImageBytes                   = 512 << 10
-	maxCombinedImageBytes           = 1 << 20
+	maxImageBytes                   = 4 << 20
+	maxCombinedImageBytes           = 4 << 20
 	maxOutputTokens                 = 16384
 	maxStreamResponseBytes          = 4 << 20
+	// maxEncodedImageURLBytes is the base64 length of maxImageBytes plus the longest image data-URL prefix (D-6).
+	maxEncodedImageURLBytes = (maxImageBytes+2)/3*4 + len("data:image/jpeg;base64,")
 )
 
 type Config struct {
@@ -87,6 +89,19 @@ type Config struct {
 	MinecraftPanelPublicOrigin *url.URL
 	OrchestratorBearerToken    string
 	ApprovalReviewBearerToken  string
+	// PS5 provider, queue, usage and alerts. The provider is off unless both PS5 URLs are set.
+	PS5ControlURL              string
+	PS5MediaURL                string
+	PS5TokenCredential         string // systemd credential name; the bearer is read from it per request
+	PS5PollInterval            time.Duration
+	QueuePerSubject            int
+	QueueGlobal                int
+	MaxQueueWait               time.Duration
+	Quotas                     quotaPolicy
+	UsageDirectory             string
+	AlertWebhookURL            string
+	AlertAuthFailuresPerMinute int
+	AlertRequestsPerMinute     int
 }
 
 // SSHTarget is an operator-defined destination. The public API accepts only its
@@ -302,6 +317,71 @@ func loadConfig() (Config, error) {
 	if !filepath.IsAbs(cfg.ModelStatePath) || filepath.Clean(cfg.ModelStatePath) != cfg.ModelStatePath {
 		return cfg, errors.New("NEXUS_MODEL_STATE_PATH must be an absolute normalized path")
 	}
+	cfg.PS5ControlURL = strings.TrimSpace(os.Getenv("NEXUS_PS5_CONTROL_URL"))
+	cfg.PS5MediaURL = strings.TrimSpace(os.Getenv("NEXUS_PS5_MEDIA_URL"))
+	if (cfg.PS5ControlURL == "") != (cfg.PS5MediaURL == "") {
+		return cfg, errors.New("NEXUS_PS5_CONTROL_URL and NEXUS_PS5_MEDIA_URL must be configured together")
+	}
+	if cfg.PS5ControlURL != "" {
+		for _, raw := range []string{cfg.PS5ControlURL, cfg.PS5MediaURL} {
+			parsed, parseErr := url.Parse(raw)
+			if parseErr != nil || !validUpstreamURL(parsed) || (parsed.Path != "" && parsed.Path != "/") {
+				return cfg, errors.New("NEXUS_PS5_CONTROL_URL and NEXUS_PS5_MEDIA_URL must be HTTPS or HTTP on a private IPv4 address, without a path")
+			}
+		}
+		cfg.PS5TokenCredential = strings.TrimSpace(os.Getenv("NEXUS_PS5_TOKEN_CREDENTIAL"))
+		if !secretSafeName(cfg.PS5TokenCredential) {
+			return cfg, errors.New("NEXUS_PS5_TOKEN_CREDENTIAL must name a systemd credential")
+		}
+		// Loaded once to fail fast at startup; the bearer is read again per request so rotation needs no restart.
+		if _, err := secretLoadCredential(cfg.PS5TokenCredential); err != nil {
+			return cfg, errors.New("NEXUS_PS5_TOKEN_CREDENTIAL could not be loaded")
+		}
+	}
+	cfg.PS5PollInterval = envDuration("NEXUS_PS5_POLL_INTERVAL", 5*time.Second)
+	if cfg.PS5PollInterval < time.Second || cfg.PS5PollInterval > 5*time.Minute {
+		return cfg, errors.New("NEXUS_PS5_POLL_INTERVAL must be between 1 second and 5 minutes")
+	}
+	cfg.QueuePerSubject = envInt("NEXUS_AI_QUEUE_PER_SUBJECT", 3)
+	if cfg.QueuePerSubject < 1 || cfg.QueuePerSubject > 20 {
+		return cfg, errors.New("NEXUS_AI_QUEUE_PER_SUBJECT must be between 1 and 20")
+	}
+	cfg.QueueGlobal = envInt("NEXUS_AI_QUEUE_GLOBAL", 20)
+	if cfg.QueueGlobal < cfg.QueuePerSubject || cfg.QueueGlobal > 200 {
+		return cfg, errors.New("NEXUS_AI_QUEUE_GLOBAL must be between NEXUS_AI_QUEUE_PER_SUBJECT and 200")
+	}
+	cfg.MaxQueueWait = envDuration("NEXUS_AI_MAX_QUEUE_WAIT", schedDefaultMaxWait)
+	if cfg.MaxQueueWait < 10*time.Second || cfg.MaxQueueWait > 30*time.Minute {
+		return cfg, errors.New("NEXUS_AI_MAX_QUEUE_WAIT must be between 10 seconds and 30 minutes")
+	}
+	// A permission without a quota rule is refused when used (see consumeQuota).
+	cfg.Quotas, err = parseQuotaPolicy(os.Getenv("NEXUS_AI_QUOTAS_JSON"))
+	if err != nil {
+		return cfg, fmt.Errorf("NEXUS_AI_QUOTAS_JSON is invalid: %w", err)
+	}
+	cfg.UsageDirectory = strings.TrimSpace(os.Getenv("NEXUS_USAGE_DIR"))
+	if cfg.UsageDirectory == "" {
+		cfg.UsageDirectory = "/var/lib/nexus-gateway/usage"
+	}
+	if !filepath.IsAbs(cfg.UsageDirectory) || filepath.Clean(cfg.UsageDirectory) != cfg.UsageDirectory {
+		return cfg, errors.New("NEXUS_USAGE_DIR must be an absolute normalized path")
+	}
+	cfg.AlertWebhookURL = strings.TrimSpace(os.Getenv("NEXUS_ALERT_WEBHOOK_URL"))
+	if cfg.AlertWebhookURL != "" {
+		hook, parseErr := url.Parse(cfg.AlertWebhookURL)
+		if parseErr != nil || hook.Scheme != "https" || hook.Host == "" || hook.User != nil || hook.RawQuery != "" || hook.Fragment != "" {
+			// Fixed text: the URL may embed a secret, so it is never echoed.
+			return cfg, errors.New("NEXUS_ALERT_WEBHOOK_URL must be a clean HTTPS URL")
+		}
+	}
+	cfg.AlertAuthFailuresPerMinute = envInt("NEXUS_ALERT_AUTH_FAILURES_PER_MINUTE", 20)
+	if cfg.AlertAuthFailuresPerMinute < 1 || cfg.AlertAuthFailuresPerMinute > 10000 {
+		return cfg, errors.New("NEXUS_ALERT_AUTH_FAILURES_PER_MINUTE must be between 1 and 10000")
+	}
+	cfg.AlertRequestsPerMinute = envInt("NEXUS_ALERT_REQUESTS_PER_MINUTE", 600)
+	if cfg.AlertRequestsPerMinute < 1 || cfg.AlertRequestsPerMinute > 100000 {
+		return cfg, errors.New("NEXUS_ALERT_REQUESTS_PER_MINUTE must be between 1 and 100000")
+	}
 	key, err := parseConversationEncryptionKey(os.Getenv("NEXUS_CONVERSATION_ENCRYPTION_KEY"))
 	if err != nil {
 		return cfg, err
@@ -354,7 +434,7 @@ func parseSubjectPermissions(raw string) (map[string]map[string]bool, error) {
 		}
 		set := make(map[string]bool, len(scopes))
 		for _, scope := range scopes {
-			if scope != permissionModels && scope != permissionChat && scope != permissionSearch && scope != permissionHistory && scope != permissionSSHConnect && scope != permissionMinecraftPanel && scope != permissionOrchestrate && scope != permissionNexusModelRead && scope != permissionNexusModelControl && scope != permissionNexusWorkspaceRead && scope != permissionNexusPatchPropose && scope != permissionNexusApprovalReview && scope != permissionNexusWorkspaceWrite && scope != permissionNexusWorkspaceExecute {
+			if scope != permissionModels && scope != permissionChat && scope != permissionSearch && scope != permissionHistory && scope != permissionSSHConnect && scope != permissionMinecraftPanel && scope != permissionOrchestrate && scope != permissionNexusModelRead && scope != permissionNexusModelControl && scope != permissionNexusWorkspaceRead && scope != permissionNexusPatchPropose && scope != permissionNexusApprovalReview && scope != permissionNexusWorkspaceWrite && scope != permissionNexusWorkspaceExecute && !quotaKnownPermissions[scope] {
 				return nil, fmt.Errorf("unsupported permission %q", scope)
 			}
 			if set[scope] {
@@ -616,6 +696,12 @@ type Gateway struct {
 	modelPending      string
 	modelSwitchActive bool
 	modelStateErr     error
+	ps5               *ps5Provider // nil unless NEXUS_PS5_CONTROL_URL and NEXUS_PS5_MEDIA_URL are set
+	queue             *queueManager
+	quota             *quotaMeter
+	alerts            *alertNotifier
+	usage             *usageLog       // set by startPS5Services
+	lifetime          context.Context // server lifetime, set by startPS5Services; video jobs outlive their request
 }
 
 func NewGateway(cfg Config, verifier TokenVerifier) *Gateway {
@@ -652,6 +738,28 @@ func NewGateway(cfg Config, verifier TokenVerifier) *Gateway {
 	if cfg.ModelStatePath != "" {
 		pending, err := readPendingModelSwitch(cfg.ModelStatePath)
 		gateway.modelPending, gateway.modelStateErr = pending, err
+	}
+	gateway.queue = newQueueManager(cfg.QueuePerSubject, cfg.QueueGlobal)
+	gateway.queue.picker = aiSchedulerPicker(gateway.ps5Snapshot, time.Now, cfg.MaxQueueWait)
+	gateway.quota = newQuotaMeter(cfg.Quotas, time.Now)
+	alertCfg := alertConfig{WebhookURL: cfg.AlertWebhookURL, AuthFailuresPerMinute: cfg.AlertAuthFailuresPerMinute,
+		RequestsPerMinute: cfg.AlertRequestsPerMinute}
+	if alertCfg.AuthFailuresPerMinute <= 0 {
+		alertCfg.AuthFailuresPerMinute = 20
+	}
+	if alertCfg.RequestsPerMinute <= 0 {
+		alertCfg.RequestsPerMinute = 600
+	}
+	var err error
+	gateway.alerts, err = newAlertNotifier(alertCfg)
+	if err != nil {
+		log.Fatalf("alert configuration invalid: %v", err)
+	}
+	if cfg.PS5ControlURL != "" {
+		gateway.ps5, err = newPS5Provider(cfg, gateway.client)
+		if err != nil {
+			log.Fatalf("PS5 provider configuration invalid: %v", err)
+		}
 	}
 	// A restart must retain unknown switches, but may confirm an exact target
 	// already proven ready by the private controller. No inference is replayed.
@@ -715,6 +823,23 @@ func (g *Gateway) Handler() http.Handler {
 	mux.Handle("POST /v1/nexus/models/{id}/load", g.authorize(permissionNexusModelControl, http.HandlerFunc(g.serveNexusOrchestrator)))
 	mux.Handle("/v1/minecraft/panel", g.authorize(permissionMinecraftPanel, http.HandlerFunc(g.serveMinecraftPanel)))
 	mux.Handle("/v1/minecraft/panel/", g.authorize(permissionMinecraftPanel, http.HandlerFunc(g.serveMinecraftPanel)))
+	status := aiStatusDeps{health: g.ps5Snapshot, queue: g.queue, now: time.Now, maxWait: g.cfg.MaxQueueWait}
+	mux.Handle("GET /v1/ai/status", g.authorize(permissionModels, aiStatusHandler(status, principalFromRequest)))
+	mux.Handle("GET /v1/ai/jobs/{id}", g.authorize(permissionModels, aiJobHandler(g.queue, principalFromRequest)))
+	// Media routes exist only with the PS5 provider; without it they fall through to the 404 below. Body caps
+	// are applied inside each handler (media_*.go), and no response-size middleware wraps these routes.
+	if g.ps5 != nil {
+		lifetime := g.lifetime
+		if lifetime == nil {
+			lifetime = context.Background()
+		}
+		mux.Handle("POST /v1/audio/transcriptions", g.authorize(quotaPermissionAudio, g.handleTranscription()))
+		mux.Handle("POST /v1/audio/speech", g.authorize(quotaPermissionAudio, g.handleSpeech()))
+		mux.Handle("POST /v1/voice/chat", g.authorize(quotaPermissionVoice, g.handleVoiceChat()))
+		mux.Handle("POST /v1/images/generations", g.authorize(quotaPermissionImage, g.handleImage()))
+		mux.Handle("POST /v1/videos/generations", g.authorize(quotaPermissionVideo, g.handleVideoGenerate(lifetime)))
+		mux.Handle("GET /v1/ai/jobs/{id}/result", g.authorize(permissionModels, g.handleVideoResult()))
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) { writeError(w, http.StatusNotFound, "not found") })
 	return g.logRequests(mux)
 }
@@ -855,12 +980,14 @@ func (g *Gateway) authorize(required string, next http.Handler) http.Handler {
 		parts := strings.Fields(authorization)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
 			logAuthorizationEvent(requestIDFromContext(r.Context()), required, r.URL.Path, "deny", "bearer_missing_or_malformed", "")
+			g.alerts.recordAuthFailure()
 			writeError(w, http.StatusUnauthorized, "authentication required")
 			return
 		}
 		subject, err := g.verifier.Subject(r.Context(), parts[1])
 		if err != nil {
 			logAuthorizationEvent(requestIDFromContext(r.Context()), required, r.URL.Path, "deny", "token_invalid", "")
+			g.alerts.recordAuthFailure()
 			writeError(w, http.StatusUnauthorized, "invalid authentication")
 			return
 		}
@@ -868,6 +995,7 @@ func (g *Gateway) authorize(required string, next http.Handler) http.Handler {
 		permissions, ok := g.cfg.SubjectPermissions[subject]
 		if !ok || !permissions[required] {
 			logAuthorizationEvent(requestIDFromContext(r.Context()), required, r.URL.Path, "deny", "permission_denied", subjectID)
+			g.alerts.recordAuthFailure()
 			writeError(w, http.StatusForbidden, "permission denied")
 			return
 		}
@@ -1059,6 +1187,10 @@ func (g *Gateway) contextWindow(w http.ResponseWriter, r *http.Request) {
 }
 
 func (g *Gateway) completions(w http.ResponseWriter, r *http.Request) {
+	if g.ps5 != nil {
+		g.queuedCompletions(w, r)
+		return
+	}
 	if !g.beginInference(w) {
 		return
 	}
@@ -1069,17 +1201,8 @@ func (g *Gateway) completions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { <-g.semaphore }()
 
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	var input completionRequest
-	if err := decoder.Decode(&input); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid chat request")
-		return
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "invalid chat request")
+	input, ok := g.decodeCompletionRequest(w, r)
+	if !ok {
 		return
 	}
 	allowed, ok := g.requestModels(w, r)
@@ -1124,11 +1247,34 @@ func (g *Gateway) completions(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(response.StatusCode)
+	copyStream(w, response.Body)
+}
+
+// decodeCompletionRequest reads exactly one bounded JSON object and writes the 400 response itself on failure.
+func (g *Gateway) decodeCompletionRequest(w http.ResponseWriter, r *http.Request) (completionRequest, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	var input completionRequest
+	if err := decoder.Decode(&input); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid chat request")
+		return input, false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid chat request")
+		return input, false
+	}
+	return input, true
+}
+
+// copyStream forwards body to w in bounded chunks, flushing each one, and stops at maxStreamResponseBytes.
+func copyStream(w http.ResponseWriter, body io.Reader) {
 	flusher, _ := w.(http.Flusher)
 	buffer := make([]byte, 16<<10)
 	var forwarded int64
 	for {
-		count, readErr := response.Body.Read(buffer)
+		count, readErr := body.Read(buffer)
 		if count > 0 {
 			remaining := int64(maxStreamResponseBytes) - forwarded
 			writeCount := min(int64(count), remaining)
@@ -1149,6 +1295,261 @@ func (g *Gateway) completions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+// queuedCompletions is the chat path when the PS5 is configured. The request waits in the PS5 queue for its turn,
+// so chats never reach llama-server together. aiLifecycle still excludes model switches, orchestrator runs and the
+// other inference routes while a chat runs.
+func (g *Gateway) queuedCompletions(w http.ResponseWriter, r *http.Request) {
+	if !g.ps5Snapshot().Online {
+		w.Header().Set("Retry-After", "30")
+		writeError(w, http.StatusServiceUnavailable, "PS5 is offline")
+		return
+	}
+	input, ok := g.decodeCompletionRequest(w, r)
+	if !ok {
+		return
+	}
+	allowed, ok := g.requestModels(w, r)
+	if !ok {
+		return
+	}
+	if err := validateCompletion(input, allowed); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	body, err := json.Marshal(input)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid chat request")
+		return
+	}
+	subject := principalFromRequest(r)
+	enqueued := time.Now()
+	job, err := g.queue.Enqueue(r.Context(), subject, "llm", input.Model)
+	if err != nil {
+		w.Header().Set("Retry-After", "10")
+		writeError(w, http.StatusTooManyRequests, "PS5 queue is full")
+		return
+	}
+	if err := g.queue.Acquire(r.Context(), job); err != nil {
+		g.queue.Finish(job, queueStateCancelled)
+		return
+	}
+	started := time.Now()
+	final := queueStateFailed
+	out := &countingWriter{ResponseWriter: w}
+	defer func() {
+		g.queue.Finish(job, final)
+		g.recordChatUsage(subject, input.Model, string(final), started.Sub(enqueued), time.Since(started), int64(len(body)), out.n)
+	}()
+	if !g.beginInference(w) {
+		return
+	}
+	defer g.aiLifecycle.Unlock()
+	if fail := g.reachEngine(job, "llm"); fail != nil {
+		if job.Context().Err() != nil {
+			final = queueStateCancelled
+			return
+		}
+		fail.write(w)
+		return
+	}
+	g.queue.Advance(job, queueStateGenerating)
+	ctx, cancel := context.WithTimeout(job.Context(), g.cfg.RequestTimeout)
+	defer cancel()
+	if err := g.ps5.Chat(ctx, body, out); err != nil {
+		if job.Context().Err() != nil {
+			final = queueStateCancelled
+		}
+		var rejected ps5ChatRejected
+		if errors.As(err, &rejected) {
+			writeError(w, http.StatusBadGateway, rejected.Error())
+		}
+		return
+	}
+	final = queueStateDone
+}
+
+// recordChatUsage appends one usage line. It carries no prompt, messages or output text.
+func (g *Gateway) recordChatUsage(subject, model, outcome string, queued, run time.Duration, in, out int64) {
+	if g.usage == nil {
+		return
+	}
+	if err := g.usage.Record(subject, usageRecord{Route: "/v1/chat/completions", Engine: "llm", Model: model,
+		Outcome: outcome, QueueMS: queued.Milliseconds(), RunMS: run.Milliseconds(), InBytes: in, OutBytes: out}); err != nil {
+		log.Printf("usage_event status=failed")
+	}
+}
+
+// countingWriter counts response bytes and keeps streaming flushes working.
+type countingWriter struct {
+	http.ResponseWriter
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.ResponseWriter.Write(p)
+	c.n += int64(n)
+	return n, err
+}
+
+func (c *countingWriter) Flush() {
+	if flusher, ok := c.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// consumeQuota charges a media permission's daily quota. A permission with no rule is refused, because the gateway
+// has no role table to fall back on. An exhausted quota raises a quota_hit alert.
+func (g *Gateway) consumeQuota(subject, permission string, amount int) (int, error) {
+	remaining, err := g.quota.Consume(subject, permission, amount)
+	if errors.Is(err, errQuotaExceeded) {
+		g.alerts.quotaHit()
+	}
+	return remaining, err
+}
+
+func principalFromRequest(r *http.Request) string {
+	principal, _ := r.Context().Value(principalKey{}).(string)
+	return principal
+}
+
+// ps5Snapshot returns the latest PS5 health snapshot, or an offline state when the PS5 is not configured.
+func (g *Gateway) ps5Snapshot() ps5State {
+	if g.ps5 == nil {
+		return ps5State{Reason: "ps5_offline"}
+	}
+	return g.ps5.health.Snapshot()
+}
+
+// startPS5Services opens the usage log and runs the PS5 health poller until ctx ends. It does nothing when the
+// PS5 is not configured.
+func (g *Gateway) startPS5Services(ctx context.Context) error {
+	if g.ps5 == nil {
+		return nil
+	}
+	g.lifetime = ctx
+	usage, err := newUsageLog(g.cfg.UsageDirectory, time.Now)
+	if err != nil {
+		return err
+	}
+	g.usage = usage
+	go g.watchPS5(ctx)
+	return nil
+}
+
+// watchPS5 polls the PS5 and raises an alert on each online or offline transition.
+func (g *Gateway) watchPS5(ctx context.Context) {
+	ticker := time.NewTicker(g.cfg.PS5PollInterval)
+	defer ticker.Stop()
+	// The PS5 is assumed online before the first poll, so an offline first poll alerts and a healthy one does not.
+	wasOnline := true
+	for {
+		state := g.ps5.health.Poll(ctx)
+		if state.Online != wasOnline {
+			if state.Online {
+				g.alerts.ps5Online()
+			} else {
+				g.alerts.ps5Offline()
+			}
+		}
+		wasOnline = state.Online
+		if state.Reason == "restart_failed" {
+			g.alerts.restartFailed()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// ps5ChatRejected is a chat the PS5 refused before any response bytes were written, so the handler can still send
+// an error status. Its message is fixed text.
+type ps5ChatRejected struct{ message string }
+
+func (e ps5ChatRejected) Error() string { return e.message }
+
+var _ Provider = (*ps5Provider)(nil)
+
+// ps5Provider is the nexusai-ps5 Provider. Chat relays to llama-server on the chat base. Control and health calls
+// go through ps5Client and the poller, which hold the PS5 bearer.
+type ps5Provider struct {
+	chat      *url.URL
+	chatToken string
+	http      *http.Client
+	control   *ps5Client
+	health    *ps5Health
+}
+
+func newPS5Provider(cfg Config, client *http.Client) (*ps5Provider, error) {
+	bearer := func() (string, error) { return secretLoadCredential(cfg.PS5TokenCredential) }
+	control, err := newPS5Client(cfg.PS5ControlURL, cfg.PS5MediaURL, bearer)
+	if err != nil {
+		return nil, err
+	}
+	health := newPS5Health(cfg.PS5ControlURL, cfg.PS5MediaURL, func() string {
+		token, _ := bearer()
+		return token
+	})
+	return &ps5Provider{chat: cfg.Upstream, chatToken: cfg.UpstreamBearerToken, http: client, control: control, health: health}, nil
+}
+
+func (p *ps5Provider) Name() string { return nexusAIPS5 }
+
+func (p *ps5Provider) Health(context.Context) ProviderHealth {
+	s := p.health.Snapshot()
+	return ProviderHealth{Online: s.Online, Ready: s.Ready, Reason: s.Reason}
+}
+
+// Chat forwards the validated body to the chat endpoint and streams the answer to w. Failures before the first
+// byte are returned as ps5ChatRejected; later stream errors simply end the response.
+func (p *ps5Provider) Chat(ctx context.Context, req ProviderRequest, w http.ResponseWriter) error {
+	endpoint := *p.chat
+	endpoint.Path = strings.TrimRight(endpoint.Path, "/") + "/chat/completions"
+	endpoint.RawPath = ""
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), bytes.NewReader(req))
+	if err != nil {
+		return ps5ChatRejected{"AI inference service unavailable"}
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "text/event-stream, application/json")
+	if p.chatToken != "" {
+		request.Header.Set("Authorization", "Bearer "+p.chatToken)
+	}
+	response, err := p.http.Do(request)
+	if err != nil {
+		return ps5ChatRejected{"AI inference service unavailable"}
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return ps5ChatRejected{"AI inference request failed"}
+	}
+	contentType := response.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(response.StatusCode)
+	copyStream(w, response.Body)
+	return nil
+}
+
+// Media forwards one media request to the PS5 media API. Callers go through runMediaJob, which holds the queue slot
+// and switches the PS5 to media mode first.
+func (p *ps5Provider) Media(ctx context.Context, kind string, req ProviderRequest) (MediaResult, error) {
+	return p.mediaForward(ctx, kind, req)
+}
+
+// EnsureEngine switches the PS5 to engine unless the last health snapshot already reports it.
+func (p *ps5Provider) EnsureEngine(ctx context.Context, engine string) error {
+	if p.health.Snapshot().Engine == engine {
+		return nil
+	}
+	return p.control.switchEngine(ctx, engine)
 }
 
 // inputTokens asks the pinned llama.cpp backend to apply the active model's
@@ -1363,22 +1764,30 @@ func validateMessageContent(role string, content json.RawMessage) error {
 	if parts[0].ImageURL != nil {
 		return errors.New("message content is invalid")
 	}
-	const prefix = "data:image/jpeg;base64,"
+	const pngPrefix, jpegPrefix = "data:image/png;base64,", "data:image/jpeg;base64,"
 	totalImageBytes := 0
 	for _, part := range parts[1:] {
 		if part.Type != "image_url" || part.ImageURL == nil || part.Text != "" ||
-			!strings.HasPrefix(part.ImageURL.URL, prefix) || (part.ImageURL.Detail != "" && part.ImageURL.Detail != "auto" &&
-			part.ImageURL.Detail != "low" && part.ImageURL.Detail != "high") {
-			return errors.New("image attachment must be a bounded JPEG data URL")
+			(part.ImageURL.Detail != "" && part.ImageURL.Detail != "auto" &&
+				part.ImageURL.Detail != "low" && part.ImageURL.Detail != "high") {
+			return errors.New("image attachment must be a bounded PNG or JPEG data URL")
 		}
-		encoded := strings.TrimPrefix(part.ImageURL.URL, prefix)
-		if len(encoded) > 700*1_024 {
+		raw := part.ImageURL.URL
+		isPNG := strings.HasPrefix(raw, pngPrefix)
+		if !isPNG && !strings.HasPrefix(raw, jpegPrefix) {
+			return errors.New("image attachment must be a bounded PNG or JPEG data URL")
+		}
+		if len(raw) > maxEncodedImageURLBytes {
 			return errors.New("image attachment is too large")
 		}
-		decoded, err := base64.StdEncoding.Strict().DecodeString(encoded)
-		if err != nil || len(decoded) < 4 || len(decoded) > maxImageBytes ||
-			!bytes.HasPrefix(decoded, []byte{0xFF, 0xD8, 0xFF}) || !bytes.HasSuffix(decoded, []byte{0xFF, 0xD9}) {
-			return errors.New("image attachment is not a valid bounded JPEG")
+		decoded, err := base64.StdEncoding.Strict().DecodeString(raw[strings.IndexByte(raw, ',')+1:])
+		// The declared type must match the bytes: PNG signature, or JPEG SOI through EOI.
+		valid := mediaValIsJPEG(decoded) && bytes.HasSuffix(decoded, []byte{0xFF, 0xD9})
+		if isPNG {
+			valid = mediaValIsPNG(decoded)
+		}
+		if err != nil || len(decoded) > maxImageBytes || !valid {
+			return errors.New("image attachment is not a valid bounded PNG or JPEG")
 		}
 		totalImageBytes += len(decoded)
 		if totalImageBytes > maxCombinedImageBytes {
@@ -1422,6 +1831,7 @@ func (g *Gateway) logRequests(next http.Handler) http.Handler {
 		wrapped.Header().Set("X-Request-ID", id)
 		start := time.Now()
 		r = r.WithContext(context.WithValue(r.Context(), requestIDKey{}, id))
+		g.alerts.recordRequest()
 		next.ServeHTTP(wrapped, r)
 		log.Printf("request_id=%s method=%s route=%s status=%d duration_ms=%d", id, r.Method, routeName(r.URL.Path), wrapped.status, time.Since(start).Milliseconds())
 	})
@@ -1429,7 +1839,7 @@ func (g *Gateway) logRequests(next http.Handler) http.Handler {
 
 func routeName(path string) string {
 	switch path {
-	case "/healthz", "/v1/models", "/v1/context", "/v1/chat/completions", "/v1/search", "/v1/research", "/v1/conversations", "/v1/nexus/workspaces", "/v1/nexus/agent-runs", "/v1/nexus/agent-runs/active", "/v1/nexus/models", "/v1/nexus/status", "/v1/nexus/models/status", "/v1/nexus/models/unload":
+	case "/healthz", "/v1/models", "/v1/context", "/v1/chat/completions", "/v1/search", "/v1/research", "/v1/conversations", "/v1/nexus/workspaces", "/v1/nexus/agent-runs", "/v1/nexus/agent-runs/active", "/v1/nexus/models", "/v1/nexus/status", "/v1/nexus/models/status", "/v1/nexus/models/unload", "/v1/ai/status", "/v1/audio/transcriptions", "/v1/audio/speech", "/v1/voice/chat", "/v1/images/generations", "/v1/videos/generations":
 		return path
 	default:
 		if strings.HasPrefix(path, "/v1/nexus/agent-runs/") {
@@ -1440,6 +1850,12 @@ func routeName(path string) string {
 		}
 		if strings.HasPrefix(path, minecraftPanelGatewayPrefix) {
 			return "/v1/minecraft/panel/{path}"
+		}
+		if strings.HasPrefix(path, "/v1/ai/jobs/") {
+			if strings.HasSuffix(path, "/result") {
+				return "/v1/ai/jobs/{id}/result"
+			}
+			return "/v1/ai/jobs/{id}"
 		}
 		if strings.HasPrefix(path, "/v1/ssh/") {
 			return "/v1/ssh/{target}"
@@ -1509,9 +1925,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("OIDC access-token verification setup failed: %v", err)
 	}
+	gateway := NewGateway(cfg, verifier)
+	lifetime, stopServices := context.WithCancel(context.Background())
+	defer stopServices()
+	if err := gateway.startPS5Services(lifetime); err != nil {
+		log.Fatalf("PS5 services failed to start: %v", err)
+	}
 	server := &http.Server{
 		Addr:              cfg.ListenAddress,
-		Handler:           NewGateway(cfg, verifier).Handler(),
+		Handler:           gateway.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    16 << 10,

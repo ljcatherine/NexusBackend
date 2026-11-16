@@ -8,6 +8,7 @@ Type=simple
 User=nexus-gateway
 Group=nexus-gateway
 EnvironmentFile=/etc/nexus-gateway/nexus.env
+LoadCredential=nexus-ps5-token:/etc/nexus-gateway/ps5-token
 ExecStart=/usr/local/bin/nexus-gateway
 Restart=on-failure
 RestartSec=5s

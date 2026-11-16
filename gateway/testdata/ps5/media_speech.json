@@ -1,0 +1,1 @@
+{"model":"qwen3-tts-1.7b","sample_rate":16000,"frames":160,"timings":{"load_s":0.0,"generate_s":0.0},"audio_b64":"__WAV_B64__"}

@@ -1,0 +1,29 @@
+// Example Tailscale policy for the Nexus gateway and the PS5 (placeholders only).
+//
+// Tailscale is default-deny: with no matching accept rule, traffic is dropped.
+// The only rule below that reaches the PS5 lets the gateway tag reach ports
+// 8081, 8082 and 8083. Nothing else may reach the PS5.
+//
+// Replace owner@example.com with your Tailscale login. Do not put real IPs,
+// emails or keys in this file.
+//
+// If the PS5 is reached through a subnet router instead of being a tagged
+// node, use the PS5's LAN address placeholder (for example 192.0.2.10) in
+// place of tag:nexus-ps5 in the dst below, and advertise that LAN route from
+// the subnet router. The rule stays the same otherwise.
+{
+  // Who may apply these tags. Keep this to your own account.
+  "tagOwners": {
+    "tag:nexus-gateway": ["owner@example.com"],
+    "tag:nexus-ps5": ["owner@example.com"],
+  },
+
+  "acls": [
+    // The only path to the PS5: gateway tag to the PS5 tag, three ports.
+    {
+      "action": "accept",
+      "src": ["tag:nexus-gateway"],
+      "dst": ["tag:nexus-ps5:8081,8082,8083"],
+    },
+  ],
+}

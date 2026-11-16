@@ -1,0 +1,1 @@
+{"models":[{"id":"0123456789abcdef","label":"Qwen3-4B-Q4_K_M","drive":"app0","architecture":"qwen3","file_size_bytes":2500000000,"quantization_type":15,"fits":true,"current":true},{"id":"fedcba9876543210","label":"Mock-Large-Q8_0","drive":"app0","architecture":"llama","file_size_bytes":9000000000,"quantization_type":7,"fits":false,"current":false}]}

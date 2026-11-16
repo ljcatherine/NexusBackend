@@ -1,0 +1,1 @@
+{"text":"mock transcript","language":"en","model":"whisper/ggml-large-v3-turbo-q5_0.bin","segments":[{"start":0.0,"end":0.01,"text":"mock transcript"}],"timings":{"audio_s":0.01,"load_s":0.0,"transcribe_s":0.0}}

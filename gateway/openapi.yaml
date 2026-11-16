@@ -6,12 +6,19 @@ info:
     Contract for the currently implemented Nexus AI gateway. The service is a
     loopback-only prototype and is not deployed. Authenticated routes require a
     signed JWT access token and an operator-granted permission for its subject.
+    PS5 mode (NEXUS_PS5_CONTROL_URL and NEXUS_PS5_MEDIA_URL both set) queues chat and
+    media work on the PS5. Only in that mode are the media routes registered; otherwise
+    they answer 404. Every error body is {"error":{"message":...}}.
 servers:
   - url: http://127.0.0.1:8787
     description: Local development only; the service binds to loopback.
 tags:
   - name: Health
   - name: AI
+  - name: PS5
+    description: Queue status and job state. Available whenever the gateway runs.
+  - name: Media
+    description: Image, video, speech, transcription and voice routes. PS5 mode only.
 paths:
   /healthz:
     get:
@@ -92,7 +99,15 @@ paths:
         messages, 128 KiB per text message, and 16384 output tokens. At most one
         Nexus saved-host-snapshot function definition is accepted; the gateway
         validates but never executes tools. User bearer tokens are not forwarded
-        to inference.
+        to inference. In PS5 mode the request waits in the PS5 queue; per-subject
+        and global limits answer 429 PS5 queue is full with Retry-After 10, and an
+        offline PS5 answers 503 PS5 is offline with Retry-After 30. When the PS5 runs
+        another engine, the request waits in the queue while the gateway switches it
+        to llm, then streams the response. Switch failures answer 503 PS5 could not
+        switch to chat mode, a switch that does not become ready in 10 minutes answers
+        503 PS5 chat is not ready, and the PS5 staying offline for 45 seconds during a
+        switch answers 503 PS5 is offline; each has Retry-After 30. Images are PNG or
+        JPEG data URLs (see ChatRequest).
       security:
         - bearerAuth: []
       requestBody:
@@ -123,7 +138,10 @@ paths:
         '502':
           $ref: '#/components/responses/UpstreamFailure'
         '503':
-          description: AI capacity is currently full.
+          description: >-
+            Direct mode: AI capacity is full. PS5 mode: the PS5 is offline (Retry-After 30),
+            could not switch to chat mode or is not ready after the switch timeout (Retry-After 30),
+            or a model switch or orchestrator task holds the inference lock.
           content:
             application/json:
               schema:
@@ -380,6 +398,260 @@ paths:
         '404': { description: No conversation with this ID belongs to the verified subject. }
         '409': { description: Revision is stale; refresh before retrying. }
         '428': { description: If-Match revision is required. }
+  /v1/ai/status:
+    get:
+      tags: [PS5]
+      operationId: getAIStatus
+      summary: Read PS5 state, queue length and the caller's own jobs
+      description: >-
+        Always registered. With PS5 mode off it reports online false and reason ps5_offline.
+        queue_length counts every subject; jobs lists only the caller's queued and running jobs.
+      x-required-permission: ai.models
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Current PS5 and queue state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AIStatus'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/ai/jobs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[0-9a-f]{32}$' }
+    get:
+      tags: [PS5]
+      operationId: getAIJob
+      summary: Read the state of one of the caller's jobs
+      description: >-
+        Unknown, expired and other subjects' IDs get the same 404 body, so IDs cannot be
+        probed. The process keeps its 256 most recent finished jobs.
+      x-required-permission: ai.models
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Job state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AIJob'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: job not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/ai/jobs/{id}/result:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[0-9a-f]{32}$' }
+    get:
+      tags: [PS5]
+      operationId: getAIJobResult
+      summary: Download a finished video (one read)
+      description: >-
+        Returns the bytes and removes them. Results expire 10 minutes after the job finishes,
+        and the shared store holds at most 128 MiB. An unfinished, failed, expired, already-read
+        or other subject's job gets 404 job not found.
+      x-required-permission: ai.models
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Video bytes.
+          headers:
+            Content-Disposition:
+              schema: { type: string, const: inline }
+          content:
+            video/mp4:
+              schema: { type: string, format: binary }
+            video/webm:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: job not found
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+  /v1/audio/transcriptions:
+    post:
+      tags: [Media]
+      operationId: transcribeAudio
+      summary: Transcribe a WAV file on the PS5
+      description: >-
+        PS5 mode only. Body up to 16 MiB. audio_b64 must be a WAV file of at most 10 MiB decoded
+        and 60 seconds. Quota ai.audio is charged whole seconds of audio, rounded up. The model is
+        fixed on the server.
+      x-required-permission: ai.audio
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TranscriptionRequest' }
+      responses:
+        '200':
+          description: Transcript with segments.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TranscriptionResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/MediaLimited' }
+        '502': { $ref: '#/components/responses/UpstreamFailure' }
+        '503': { $ref: '#/components/responses/PS5Unavailable' }
+  /v1/audio/speech:
+    post:
+      tags: [Media]
+      operationId: createSpeech
+      summary: Synthesize speech as WAV on the PS5
+      description: >-
+        PS5 mode only. input is 1 to 1000 characters. A reference voice (voice_reference_b64)
+        needs ai.voice.clone and consent true, and is forwarded to the PS5 without being stored.
+        Quota ai.audio is charged one per request.
+      x-required-permission: ai.audio
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SpeechRequest' }
+      responses:
+        '200':
+          description: WAV audio.
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            audio/wav:
+              schema: { type: string, format: binary }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: >-
+            Permission missing; no daily quota configured for ai.audio; voice cloning
+            not permitted (ai.voice.clone); or consent missing for a reference voice.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/MediaLimited' }
+        '502': { $ref: '#/components/responses/UpstreamFailure' }
+        '503': { $ref: '#/components/responses/PS5Unavailable' }
+  /v1/voice/chat:
+    post:
+      tags: [Media]
+      operationId: voiceChat
+      summary: Run one spoken turn on the PS5 and stream its events
+      description: >-
+        PS5 mode only. Responds with server-sent events: each PS5 event is one data line, relayed
+        without parsing. Once the stream has started it always ends with data: [DONE]. Event names
+        from the PS5 plan: status, transcript, text, audio (with audio_b64), done. A PS5 error arrives
+        as {"type":"error","message":...}. The system prompt is fixed. Quota ai.voice is charged whole
+        seconds of input audio, rounded up. A reference voice is checked for consent before the
+        ai.voice.clone permission, so a missing consent is 400 and a missing permission is 403.
+      x-required-permission: ai.voice
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VoiceChatRequest' }
+      responses:
+        '200':
+          description: 'SSE stream of PS5 events, ending with data: [DONE].'
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413': { $ref: '#/components/responses/PayloadTooLarge' }
+        '429': { $ref: '#/components/responses/MediaLimited' }
+        '503': { $ref: '#/components/responses/PS5Unavailable' }
+  /v1/images/generations:
+    post:
+      tags: [Media]
+      operationId: createImage
+      summary: Generate an image on the PS5
+      description: >-
+        PS5 mode only. Without stream the reply is JSON with the first PNG. With stream true the
+        reply is SSE: PS5 events are relayed as data lines, and a successful run ends with
+        data: [DONE]. A refusal before the first event is a JSON error. A failure after it ends with
+        data: {"error":{"message":...}} unless the PS5 already sent an error event. Quota ai.image is
+        charged one per request. A body over 12 MiB is 400 invalid image request.
+      x-required-permission: ai.image
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImageGenerationRequest' }
+      responses:
+        '200':
+          description: JSON with the first PNG, or an SSE stream when stream is true.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ImageGenerationResponse' }
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/MediaLimited' }
+        '502': { $ref: '#/components/responses/UpstreamFailure' }
+        '503': { $ref: '#/components/responses/PS5Unavailable' }
+  /v1/videos/generations:
+    post:
+      tags: [Media]
+      operationId: createVideo
+      summary: Start a video generation job
+      description: >-
+        PS5 mode only. Quota and queue are checked before the 202, so refusals come back as errors.
+        The job runs under the server's lifetime, not the request's. Poll GET /v1/ai/jobs/{id} until
+        done, then GET /v1/ai/jobs/{id}/result once. Quota ai.video is charged one per request, and a
+        job that fails after the PS5 started generating is not refunded. There is no cancel route.
+      x-required-permission: ai.video
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/VideoGenerationRequest' }
+      responses:
+        '202':
+          description: Job accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VideoGenerationAccepted' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/MediaLimited' }
+        '503': { $ref: '#/components/responses/PS5Unavailable' }
 components:
   securitySchemes:
     bearerAuth:
@@ -426,9 +698,13 @@ components:
                   - type: string
                     maxLength: 131072
                   - type: array
-                    description: User text followed by one bounded JPEG data URL.
+                    description: >-
+                      User text first, then one to three PNG or JPEG data URLs. Each image is at
+                      most 4 MiB decoded and all images together at most 4 MiB. The bytes must match
+                      the declared type (PNG signature, or JPEG starting FF D8 FF and ending FF D9).
+                      Images are rejected on any role other than user.
                     minItems: 2
-                    maxItems: 2
+                    maxItems: 4
                     items:
                       type: object
                       additionalProperties: false
@@ -447,8 +723,8 @@ components:
                               properties:
                                 url:
                                   type: string
-                                  pattern: '^data:image/jpeg;base64,'
-                                  maxLength: 716800
+                                  pattern: '^data:image/(png|jpeg);base64,'
+                                  maxLength: 5592431
                                 detail: { type: string, enum: [auto, low, high] }
               tool_calls:
                 type: array
@@ -623,8 +899,192 @@ components:
           required: [conversation]
           properties:
             conversation: { $ref: '#/components/schemas/ConversationSyncRequest/properties/conversation' }
+    AIStatus:
+      type: object
+      required: [online, ready, busy, queue_length, jobs]
+      properties:
+        online: { type: boolean }
+        engine:
+          type: string
+          description: Engine the PS5 reports (llm or media). Omitted when unknown.
+        model:
+          type: string
+          description: Model the PS5 reports. Omitted when unknown.
+        ready: { type: boolean }
+        busy: { type: boolean, description: True while the PS5 is generating. }
+        reason:
+          type: string
+          enum: [ps5_offline, switching, loading, no_model, failed, restart_failed, media_unavailable]
+        queue_length:
+          type: integer
+          minimum: 0
+          description: Waiting jobs for all subjects.
+        jobs:
+          type: array
+          items: { $ref: '#/components/schemas/AIJobView' }
+          description: The caller's queued and running jobs only.
+        warning:
+          type: string
+          description: Set when the caller's oldest queued job needs an engine or model switch.
+    AIJobState:
+      type: string
+      enum: [queued, switching, loading, generating, done, failed, cancelled]
+    AIJobView:
+      type: object
+      required: [id, state, position]
+      properties:
+        id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        state: { $ref: '#/components/schemas/AIJobState' }
+        position:
+          type: integer
+          minimum: 0
+          description: 1-based place while queued; 0 once running or finished.
+    AIJob:
+      allOf:
+        - $ref: '#/components/schemas/AIJobView'
+        - type: object
+          required: [engine, model]
+          properties:
+            engine: { type: string, enum: [llm, media] }
+            model: { type: string }
+    TranscriptionRequest:
+      type: object
+      required: [audio_b64]
+      description: Other fields, including model, are ignored.
+      properties:
+        audio_b64:
+          type: string
+          description: Standard base64 of a WAV file, at most 10 MiB decoded and 60 seconds.
+        language:
+          type: string
+          maxLength: 16
+          pattern: '^[A-Za-z-]*$'
+        translate: { type: boolean }
+    TranscriptionResponse:
+      type: object
+      required: [text, language, segments]
+      properties:
+        text: { type: string }
+        language: { type: string }
+        segments:
+          type: array
+          items:
+            type: object
+            required: [start, end, text]
+            properties:
+              start: { type: number }
+              end: { type: number }
+              text: { type: string }
+    SpeechRequest:
+      type: object
+      required: [input]
+      description: Other fields, including model, are ignored.
+      properties:
+        input:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Text of 1 to 1000 characters. Blank text is rejected.
+        language:
+          type: string
+          maxLength: 16
+          pattern: '^[A-Za-z-]*$'
+        voice_reference_b64:
+          type: string
+          description: Optional WAV of at most 2 MiB decoded. Needs ai.voice.clone and consent true.
+        consent: { type: boolean }
+    VoiceChatRequest:
+      type: object
+      required: [audio_b64]
+      description: Client system prompts and other fields are ignored.
+      properties:
+        audio_b64:
+          type: string
+          description: Standard base64 WAV, at most 10 MiB decoded and 60 seconds.
+        messages:
+          type: array
+          description: The newest 20 user and assistant turns are kept, within 16 KiB of content. Other roles are dropped.
+          items: { $ref: '#/components/schemas/VoiceMessage' }
+        speaker_b64:
+          type: string
+          description: Optional reference WAV of at most 2 MiB decoded. Needs ai.voice.clone and consent true.
+        consent: { type: boolean }
+    VoiceMessage:
+      type: object
+      required: [role, content]
+      properties:
+        role: { type: string, enum: [user, assistant] }
+        content: { type: string }
+    ImageGenerationRequest:
+      type: object
+      additionalProperties: false
+      required: [prompt, width, height]
+      properties:
+        prompt: { type: string, minLength: 1, maxLength: 2000 }
+        model:
+          type: string
+          enum: ['', 'sd-turbo-fp16', 'flux2-klein-4b']
+          description: Empty uses the PS5 default.
+        width: { type: integer, minimum: 256, maximum: 1024, multipleOf: 64 }
+        height: { type: integer, minimum: 256, maximum: 1024, multipleOf: 64 }
+        steps: { type: integer, minimum: 1, maximum: 100 }
+        seed: { type: integer, minimum: -1 }
+        init_image_b64:
+          type: string
+          description: PNG or JPEG, base64, at most 8 MiB decoded.
+        ref_images_b64:
+          type: array
+          maxItems: 4
+          items:
+            type: string
+            description: PNG or JPEG, base64, at most 8 MiB decoded each.
+        stream: { type: boolean }
+    ImageGenerationResponse:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          minItems: 1
+          maxItems: 1
+          items:
+            type: object
+            required: [b64_json]
+            properties:
+              b64_json:
+                type: string
+                description: Standard base64 of a PNG.
+    VideoGenerationRequest:
+      type: object
+      additionalProperties: false
+      required: [prompt, width, height, frames]
+      properties:
+        prompt: { type: string, minLength: 1, maxLength: 2000 }
+        model:
+          type: string
+          enum: ['', 'wan2.1-t2v-1.3b']
+          description: Empty means wan2.1-t2v-1.3b.
+        width: { type: integer, minimum: 128, maximum: 1280, multipleOf: 16 }
+        height: { type: integer, minimum: 128, maximum: 1280, multipleOf: 16 }
+        frames:
+          type: integer
+          enum: [1, 5, 9, 13, 17, 21, 25, 29, 33]
+          description: 4k+1, at most 33.
+        init_image_b64:
+          type: string
+          description: PNG or JPEG, base64, at most 8 MiB decoded.
+        format:
+          type: string
+          enum: [mp4, webm]
+          default: mp4
+    VideoGenerationAccepted:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string, pattern: '^[0-9a-f]{32}$' }
     ErrorResponse:
       type: object
+      description: Every error body uses this nested shape. A bare string error is never returned.
       required: [error]
       properties:
         error:
@@ -649,12 +1109,32 @@ components:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
     RateLimited:
-      description: Per-subject request limit was reached.
+      description: >-
+        Per-subject request limit reached (Retry-After 60), or the PS5 queue is full
+        (Retry-After 10) on PS5 routes.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }
     UpstreamFailure:
       description: Configured upstream service failed or returned invalid data.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    PayloadTooLarge:
+      description: Request body exceeds the route's size cap.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    MediaLimited:
+      description: >-
+        Daily quota exceeded (no Retry-After), or the PS5 queue is full (Retry-After 10).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+    PS5Unavailable:
+      description: >-
+        PS5 is offline (Retry-After 30), could not switch engines or is not ready
+        (Retry-After 30), or a model switch or orchestrator task holds the inference lock.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/ErrorResponse' }

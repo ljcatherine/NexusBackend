@@ -1,0 +1,1 @@
+{"status":"ok","model_loaded":true,"model_file":"Qwen3-4B-Q4_K_M.gguf","image_model":"sd-turbo-fp16","stt_model":"whisper/ggml-large-v3-turbo-q5_0.bin","tts_model":"qwen3-tts-1.7b","parameters":{}}

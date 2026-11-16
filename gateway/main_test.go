@@ -15,7 +15,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -377,7 +381,7 @@ func TestValidateCompletionAllowsOnlyBoundedUserJPEGAttachments(t *testing.T) {
 		}
 	}
 
-	oversized := make([]byte, 512*1_024+1)
+	oversized := make([]byte, maxImageBytes+1)
 	oversized[0], oversized[1], oversized[2] = 0xFF, 0xD8, 0xFF
 	oversized[len(oversized)-2], oversized[len(oversized)-1] = 0xFF, 0xD9
 	dataURL := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(oversized)
@@ -560,5 +564,252 @@ func TestMetadataPollingCannotExhaustChatBudget(t *testing.T) {
 	}
 	if !g.allowRequestBudget("another-principal", true) || !g.allowRequestBudget("another-principal", false) {
 		t.Fatal("principal budgets must remain isolated")
+	}
+}
+
+// testPS5Gateway wires a gateway to the mock PS5: chat relays to inference, control and health go to mock.Control.
+// The bearer is a credential file in a temporary CREDENTIALS_DIRECTORY, as systemd would provide it.
+func testPS5Gateway(t *testing.T, mock *mockPS5, inference *httptest.Server) *Gateway {
+	t.Helper()
+	credentials := t.TempDir()
+	if err := os.WriteFile(filepath.Join(credentials, "ps5-token"), []byte(mockPS5Token), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CREDENTIALS_DIRECTORY", credentials)
+	parsed, _ := url.Parse(inference.URL)
+	parsed.Path = "/v1"
+	return NewGateway(Config{
+		SubjectPermissions:        map[string]map[string]bool{"alice": {permissionChat: true, permissionModels: true}, "bob": {permissionChat: true}},
+		Upstream:                  parsed,
+		UpstreamBearerToken:       mockPS5Token,
+		AllowedModels:             map[string]bool{"model-installed-by-owner": true},
+		RequestTimeout:            5 * time.Second,
+		RequestsPerMinute:         100,
+		MetadataRequestsPerMinute: 100,
+		MaximumConcurrentAI:       1,
+		PS5ControlURL:             mock.Control.URL,
+		PS5MediaURL:               mock.Media.URL,
+		PS5TokenCredential:        "ps5-token",
+		PS5PollInterval:           time.Second,
+	}, fakeVerifier{subjects: map[string]string{"alice-token": "alice", "bob-token": "bob"}})
+}
+
+func ps5ChatRequest(token, prompt string) *http.Request {
+	body := `{"model":"model-installed-by-owner","messages":[{"role":"user","content":"` + prompt + `"}],"stream":false}`
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	request.Header.Set("Authorization", "Bearer "+token)
+	return request
+}
+
+func TestChatQueued(t *testing.T) {
+	mock := newMockPS5(t)
+	mock.Set(func(s *mockPS5Switches) { s.Slow = 200 * time.Millisecond })
+	routes := mock.inferenceRoutes()
+	var (
+		mu            sync.Mutex
+		running, peak int
+	)
+	// Count requests inside the PS5 stand-in: a second chat must wait, so the peak must stay at one.
+	inference := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		running++
+		peak = max(peak, running)
+		mu.Unlock()
+		defer func() {
+			mu.Lock()
+			running--
+			mu.Unlock()
+		}()
+		routes.ServeHTTP(w, r)
+	}))
+	defer inference.Close()
+
+	gateway := testPS5Gateway(t, mock, inference)
+	if state := gateway.ps5.health.Poll(context.Background()); !state.Online || state.Engine != "llm" {
+		t.Fatalf("PS5 not online for chat: %+v", state)
+	}
+	usageDir := t.TempDir()
+	usage, err := newUsageLog(usageDir, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateway.usage = usage
+	handler := gateway.Handler()
+
+	const prompt = "private prompt marker"
+	codes := make([]int, 2)
+	var wg sync.WaitGroup
+	for i, token := range []string{"alice-token", "bob-token"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, ps5ChatRequest(token, prompt))
+			codes[i] = response.Code
+		}()
+	}
+	wg.Wait()
+	if codes[0] != http.StatusOK || codes[1] != http.StatusOK {
+		t.Fatalf("chat statuses = %v, want both 200 (second chat waits in the queue)", codes)
+	}
+	mu.Lock()
+	gotPeak := peak
+	mu.Unlock()
+	if gotPeak != 1 {
+		t.Fatalf("peak concurrent PS5 chats = %d, want 1", gotPeak)
+	}
+	files, err := filepath.Glob(filepath.Join(usageDir, "usage-*.jsonl"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("usage files = %v, err = %v", files, err)
+	}
+	logged, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lines := strings.Count(string(logged), "\n"); lines != 2 {
+		t.Fatalf("usage lines = %d, want 2", lines)
+	}
+	if strings.Contains(string(logged), prompt) {
+		t.Fatal("usage log contains prompt text")
+	}
+}
+
+func TestChatOffline(t *testing.T) {
+	mock := newMockPS5(t)
+	mock.Set(func(s *mockPS5Switches) { s.Offline = true })
+	var reached atomic.Bool
+	inference := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Store(true) }))
+	defer inference.Close()
+
+	gateway := testPS5Gateway(t, mock, inference)
+	if state := gateway.ps5.health.Poll(context.Background()); state.Online {
+		t.Fatalf("PS5 reported online while its control API is down: %+v", state)
+	}
+	response := httptest.NewRecorder()
+	gateway.Handler().ServeHTTP(response, ps5ChatRequest("alice-token", "hello"))
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get("Retry-After") == "" ||
+		strings.TrimSpace(response.Body.String()) != `{"error":{"message":"PS5 is offline"}}` {
+		t.Fatalf("offline chat: status=%d retry-after=%q body=%q", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+	}
+	if reached.Load() {
+		t.Fatal("offline chat reached the PS5 inference server")
+	}
+	status := httptest.NewRecorder()
+	statusRequest := httptest.NewRequest(http.MethodGet, "/v1/ai/status", nil)
+	statusRequest.Header.Set("Authorization", "Bearer alice-token")
+	gateway.Handler().ServeHTTP(status, statusRequest)
+	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"online":false`) ||
+		!strings.Contains(status.Body.String(), `"reason":"ps5_offline"`) {
+		t.Fatalf("status while offline: %d %s", status.Code, status.Body.String())
+	}
+}
+
+func TestChatQueueFullReturns429WithQueueMessage(t *testing.T) {
+	mock := newMockPS5(t)
+	inference := httptest.NewServer(mock.inferenceRoutes())
+	defer inference.Close()
+	gateway := testPS5Gateway(t, mock, inference)
+	if state := gateway.ps5.health.Poll(context.Background()); !state.Online {
+		t.Fatalf("PS5 not online: %+v", state)
+	}
+	// Fill alice's per-subject allowance with jobs that never start, so her next chat is refused.
+	for range queueDefaultPerSubject {
+		if _, err := gateway.queue.Enqueue(context.Background(), "alice", "llm", "model-installed-by-owner"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	response := httptest.NewRecorder()
+	gateway.Handler().ServeHTTP(response, ps5ChatRequest("alice-token", "hello"))
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") == "" ||
+		!strings.Contains(response.Body.String(), "PS5 queue is full") {
+		t.Fatalf("queue full: status=%d retry-after=%q body=%q", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+	}
+}
+
+func TestAIPermissionsAndQuotaDefaultDeny(t *testing.T) {
+	permissions, err := parseSubjectPermissions(`{"owner":["ai.image","ai.video","ai.audio","ai.voice","ai.voice.clone"]}`)
+	if err != nil || len(permissions["owner"]) != 5 {
+		t.Fatalf("media permissions rejected: %v", err)
+	}
+	// A permission with no quota rule is refused, and an exhausted rule raises a quota error without an alert sink.
+	gateway := &Gateway{quota: newQuotaMeter(quotaPolicy{quotaPermissionVideo: {Unit: quotaUnitRequests, Limit: 1}}, time.Now)}
+	if _, err := gateway.consumeQuota("owner", quotaPermissionImage, 1); !errors.Is(err, errQuotaNotConfigured) {
+		t.Fatalf("unconfigured permission: err = %v", err)
+	}
+	if _, err := gateway.consumeQuota("owner", quotaPermissionVideo, 1); err != nil {
+		t.Fatalf("first video within quota: %v", err)
+	}
+	if _, err := gateway.consumeQuota("owner", quotaPermissionVideo, 1); !errors.Is(err, errQuotaExceeded) {
+		t.Fatalf("second video: err = %v, want quota exceeded", err)
+	}
+}
+
+func TestMediaRoutesRegistered(t *testing.T) {
+	const catchAll = `{"error":{"message":"not found"}}`
+	routes := []struct {
+		method, path, permission, body string
+	}{
+		{http.MethodPost, "/v1/audio/transcriptions", quotaPermissionAudio, "{}"},
+		{http.MethodPost, "/v1/audio/speech", quotaPermissionAudio, "{}"},
+		{http.MethodPost, "/v1/voice/chat", quotaPermissionVoice, "{}"},
+		{http.MethodPost, "/v1/images/generations", quotaPermissionImage, "{}"},
+		{http.MethodPost, "/v1/videos/generations", quotaPermissionVideo, "{}"},
+		{http.MethodGet, "/v1/ai/jobs/0123456789abcdef0123456789abcdef/result", permissionModels, ""},
+	}
+	send := func(handler http.Handler, method, path, token, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(method, path, strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+
+	// PS5 configured: the media subject holds every media permission; bob holds chat only.
+	mock := newMockPS5(t)
+	inference := httptest.NewServer(mock.inferenceRoutes())
+	t.Cleanup(inference.Close)
+	gateway := testPS5Gateway(t, mock, inference)
+	if state := gateway.ps5.health.Poll(context.Background()); !state.Online {
+		t.Fatalf("PS5 not online: %+v", state)
+	}
+	gateway.cfg.SubjectPermissions["media"] = map[string]bool{permissionModels: true, quotaPermissionAudio: true,
+		quotaPermissionVoice: true, quotaPermissionImage: true, quotaPermissionVideo: true}
+	gateway.verifier = fakeVerifier{subjects: map[string]string{"media-token": "media", "bob-token": "bob"}}
+	handler := gateway.Handler()
+	for _, route := range routes {
+		if response := send(handler, route.method, route.path, "bob-token", route.body); response.Code != http.StatusForbidden {
+			t.Errorf("%s %s without %s: status = %d, want 403", route.method, route.path, route.permission, response.Code)
+		}
+		response := send(handler, route.method, route.path, "media-token", route.body)
+		if response.Code == http.StatusForbidden || response.Code == http.StatusMethodNotAllowed ||
+			strings.TrimSpace(response.Body.String()) == catchAll {
+			t.Errorf("%s %s with %s is not routed: status = %d", route.method, route.path, route.permission, response.Code)
+		}
+	}
+
+	// PS5 not configured: the same paths fall through to the generic 404, even for an authorized subject.
+	upstream := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(upstream.Close)
+	plain := testGateway(upstream, map[string]map[string]bool{"owner-subject": {permissionModels: true,
+		quotaPermissionAudio: true, quotaPermissionVoice: true, quotaPermissionImage: true, quotaPermissionVideo: true}}).Handler()
+	for _, route := range routes {
+		response := send(plain, route.method, route.path, "valid-token", route.body)
+		if response.Code != http.StatusNotFound || strings.TrimSpace(response.Body.String()) != catchAll {
+			t.Errorf("%s %s without PS5: status = %d, want generic 404", route.method, route.path, response.Code)
+		}
+	}
+
+	// Per-route request body caps (D-6 and plan U-51): each handler bounds its own body.
+	caps := map[string][2]int{
+		"transcription": {sttMaxBodyBytes, 16 << 20},
+		"speech":        {ttsMaxBodyBytes, 4 << 20},
+		"voice":         {mediaVoiceMaxBodyBytes, 16 << 20},
+		"image":         {mediaImageMaxRequestBytes, 12 << 20},
+		"video":         {mediaVideoMaxBodyBytes, 16 << 20},
+	}
+	for name, limit := range caps {
+		if limit[0] != limit[1] {
+			t.Errorf("%s request cap = %d, want %d", name, limit[0], limit[1])
+		}
 	}
 }

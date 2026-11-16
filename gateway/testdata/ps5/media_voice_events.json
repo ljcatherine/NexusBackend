@@ -1,0 +1,1 @@
+[{"status":"loading"},{"type":"transcript","text":"mock question","audio_s":0.01,"at_s":0.1},{"type":"text","delta":"Hello"},{"type":"audio","index":0,"audio_s":0.01,"tts_s":0.0,"at_s":0.2,"text":"Hello.","audio_b64":"__WAV_B64__"},{"type":"done","transcript":"mock question","reply":"Hello.","tokens":2,"sentences":1,"timings":{}}]

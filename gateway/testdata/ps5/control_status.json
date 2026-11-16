@@ -1,0 +1,1 @@
+{"state":"ready","model_id":"0123456789abcdef","model":"Qwen3-4B-Q4_K_M","context_size":4096,"context_used":0,"generation_tps":0.0,"prompt_tps":0.0,"memory_pool_gib":10.0,"memory_free_gib":4.0,"model_gib":2.5,"kv_cache_gib":0.5,"load_progress":null,"engine":"llm","ready":true}
