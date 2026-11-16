@@ -1,0 +1,32 @@
+[Unit]
+Description=Nexus Mail (owner mailbox; reached only through the Cloudflare tunnel)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nexus-mail
+Group=nexus-mail
+EnvironmentFile=/etc/nexus-mail/nexus-mail.env
+ExecStart=/usr/bin/python3 /opt/nexus-mail/server.py
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+StateDirectory=nexus-mail
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

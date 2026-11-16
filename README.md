@@ -72,6 +72,7 @@ so the server opens no inbound ports.
 | 🛡️ | [**`gateway/`**](gateway) | Go service on `127.0.0.1:8787`. OIDC-verified routes for AI chat, model control, search, encrypted conversation sync, the SSH relay and the Minecraft panel proxy. Ships systemd unit templates. |
 | ☁️ | [**`cloudflare/`**](cloudflare) | The `nexus-gateway` Worker. Checks Access, then forwards an allowlist of routes and methods over Workers VPC. Serves the panel only on its own hostname. |
 | 🧠 | [**`agent-orchestrator/`**](agent-orchestrator) | Python service that turns chats into durable agent runs, with human review for every patch and command. |
+| ✉️ | [**`mail/`**](mail) | Python mail service on `127.0.0.1:8898` behind [mail.liamjc.dev](https://mail.liamjc.dev). Stores your mailbox on Debian and sends through an SMTP relay. Standard library only. |
 | 📂 | [**`workspace-agent/`**](workspace-agent) | Go read-only workspace bridge, one per host (Debian and NixOS). |
 | 🤖 | [**`integrations/hermes/`**](integrations/hermes) | Optional Hermes engine worker used by the orchestrator. |
 | 🔑 | [**`auth/keycloak/`**](auth/keycloak) | Self-hosted Nexus sign-in page: a Keycloak theme and realm that Cloudflare Access uses with instant auth, so you never see Cloudflare's login screen. |
@@ -131,6 +132,7 @@ The Worker strips Cloudflare's `CF_*` cookies before forwarding, so the panel ne
 (cd cloudflare && node --test)
 (cd agent-orchestrator && python3 -m unittest)          # Linux only (uses fcntl)
 python3 -m unittest discover -s scripts -p 'test_*.py'
+(cd mail && python3 -m unittest test_server)
 ```
 
 ## Secrets stay on the server
