@@ -31,7 +31,9 @@ say() { printf '\n== %s\n' "$*"; }
 login() {
   say "Signing in to the Keycloak admin API at $SERVER (master realm)"
   read -rp "Admin username: " admin
-  kc config credentials --server "$SERVER" --realm master --user "$admin" >/dev/null
+  # No output redirection here: kcadm (Java) only prompts for the password when stdout is a
+  # terminal, otherwise it fails with "Console is not active, but password is required".
+  kc config credentials --server "$SERVER" --realm master --user "$admin"
 }
 
 backup() {
